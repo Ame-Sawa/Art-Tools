@@ -1,0 +1,14 @@
+# Local Python environments and generated caches
+.venv/
+.pytest_cache/
+.tmp/
+.pip-cache/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Machine-local configuration
+.env.local
+
+# cli-anything preview/session artifacts
+.cli-anything/
