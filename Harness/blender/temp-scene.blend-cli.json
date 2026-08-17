@@ -1,0 +1,50 @@
+{
+  "cameras": [],
+  "collections": [
+    {
+      "id": 0,
+      "name": "Collection",
+      "objects": [],
+      "visible": true
+    }
+  ],
+  "lights": [],
+  "materials": [],
+  "metadata": {
+    "created": "2026-04-04T13:33:07.066134",
+    "modified": "2026-04-04T13:34:00.681150",
+    "software": "blender-cli 1.0"
+  },
+  "name": "temp",
+  "objects": [],
+  "render": {
+    "engine": "EEVEE",
+    "film_transparent": false,
+    "output_format": "PNG",
+    "output_path": "./render/",
+    "resolution_percentage": 100,
+    "resolution_x": 960,
+    "resolution_y": 540,
+    "samples": 16,
+    "use_denoising": true
+  },
+  "scene": {
+    "fps": 24,
+    "frame_current": 1,
+    "frame_end": 250,
+    "frame_start": 1,
+    "unit_scale": 1.0,
+    "unit_system": "metric"
+  },
+  "version": "1.0",
+  "world": {
+    "background_color": [
+      0.05,
+      0.05,
+      0.05
+    ],
+    "hdri_path": null,
+    "hdri_strength": 1.0,
+    "use_hdri": false
+  }
+}
