@@ -164,11 +164,23 @@ fbx smart-uv-project ABSOLUTE_INPUT_FBX
     [--margin-method METHOD] [--rotate-method METHOD] [--island-margin N]
     [--area-weight N] [--correct-aspect|--no-correct-aspect]
     [--scale-to-bounds|--no-scale-to-bounds]
+
+fbx auto-uniform-uv ABSOLUTE_INPUT_FBX
+    [--output ABSOLUTE_OUTPUT_FBX | --overwrite-source] [--overwrite]
+    [--timeout SECONDS] [--angle-deg DEGREES]...
 ```
 
 FBX render and Smart UV commands execute Blender headlessly and verify their
 outputs. Keep source files intact by choosing a separate output path unless
 replacement is explicitly requested.
+
+`auto-uniform-uv` removes source UV layers and re-unwraps each unique mesh. It
+searches the default angle candidates 10, 15, 20, 25, 30, 40, 50, 60, and 66
+degrees unless repeated `--angle-deg` values are supplied. It selects by
+area-weighted P95 local stretch, maximum stretch, then texel-density variation;
+UV island count and packing efficiency are not optimization targets. JSON mode
+reports every candidate and the selected metrics before the normal FBX
+round-trip validation.
 
 ## Session
 

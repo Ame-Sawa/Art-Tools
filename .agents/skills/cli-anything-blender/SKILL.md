@@ -152,11 +152,32 @@ an ad-hoc bpy importer. Use absolute paths and verify every returned output:
 & $cli --json fbx material-colors 'C:\assets\model.fbx' 'C:\out\materials.png' --overwrite
 & $cli --json fbx multi-angle 'C:\assets\model.fbx' 'C:\out\views' --view front --view right --view top --overwrite
 & $cli --json fbx smart-uv-project 'C:\assets\model.fbx' --output 'C:\out\model_uv.fbx' --overwrite
+& $cli --json fbx auto-uniform-uv 'C:\assets\model.fbx' --output 'C:\out\model_uniform_uv.fbx' --overwrite
 ```
 
 `smart-uv-project` validates the exported scene after Smart UV unwrapping.
 Use `--overwrite-source` only when the user explicitly wants the source FBX
 replaced and no separate output path is supplied.
+
+For the repository's fixed objective of a uniform checkerboard, prefer
+`fbx auto-uniform-uv`. It ignores source UV coordinates, removes existing UV
+layers, creates a fresh `map1`, searches Smart UV angle candidates, and ranks
+them by local checker stretch first and texel-density variation second. The
+default candidates are 10, 15, 20, 25, 30, 40, 50, 60, and 66 degrees; use
+repeated `--angle-deg` options to supply a smaller or custom search set. In
+JSON mode inspect `selected_angle_limit_degrees`, `selected_metrics`,
+`candidates`, and `validation`. The selected metrics include `stretch_p95`,
+`stretch_max`, `density_log_std`, and `invalid_triangles`.
+
+Use `smart-uv-project` when a single known angle or other explicit Smart UV
+settings must be applied. Its `--angle-limit` is in radians and it does not
+search or rank candidates. Do not compare source UV coordinates for a
+re-unwrapping task; compare only hierarchy, transforms, mesh structure,
+materials, animation, and output UV validity.
+
+For safe delivery, write to a separate absolute output path by default. Use
+`--overwrite` only for a confirmed generated output path. Keep the Unity or
+source FBX untouched unless `--overwrite-source` was explicitly requested.
 
 ## Completion checklist
 

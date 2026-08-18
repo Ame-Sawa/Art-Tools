@@ -203,9 +203,10 @@ fbx render <input.fbx> <output.png>              - Import FBX into an empty scen
 fbx material-colors <input.fbx> <output.png>     - Render with a distinct color for each mesh material slot
 fbx multi-angle <input.fbx> <output-dir>         - Render several views in one Blender run
 fbx smart-uv-project <input.fbx>                 - Smart UV unwrap all meshes and export an FBX
+fbx auto-uniform-uv <input.fbx>                  - Search UV angles for the most uniform checkerboard result
 ```
 
-Both commands execute Blender headlessly, set up an automatic camera and
+These FBX commands execute Blender headlessly, set up an automatic camera and
 three-point area lighting based on the imported model bounds, then verify that
 the output file was written. Typical use:
 
@@ -217,6 +218,8 @@ cli-anything-blender fbx multi-angle .\model.fbx .\output\views --view front --v
 cli-anything-blender fbx smart-uv-project .\model.fbx
 cli-anything-blender fbx smart-uv-project .\model.fbx --output .\output\model_uv.fbx --overwrite
 cli-anything-blender fbx smart-uv-project .\model.fbx --overwrite-source
+cli-anything-blender fbx auto-uniform-uv .\model.fbx --output .\output\model_uniform_uv.fbx --overwrite
+cli-anything-blender fbx auto-uniform-uv .\model.fbx --angle-deg 15 --angle-deg 20 --angle-deg 30
 ```
 
 `fbx smart-uv-project` writes `model_uv.fbx` beside the source by default. It
@@ -228,6 +231,16 @@ and UV presence. `--overwrite-source` is required to replace the input file;
 such as `--angle-limit`, `--margin-method`, `--rotate-method`,
 `--island-margin`, `--area-weight`, `--correct-aspect`, and
 `--scale-to-bounds` are available as command options.
+
+`fbx auto-uniform-uv` ignores the source UV coordinates, removes existing UV
+layers, and searches Smart UV angle candidates. It selects the result by
+minimizing area-weighted P95 local checker stretch, then maximum stretch, then
+texel-density variation. UV island count, packing efficiency, and texture
+continuity are not part of this objective. Default angle candidates are 10,
+15, 20, 25, 30, 40, 50, 60, and 66 degrees; repeat `--angle-deg` to provide a
+custom candidate set. The command emits every candidate's metrics and the
+selected angle in JSON mode, then performs the same FBX round-trip validation
+as `smart-uv-project`.
 
 Supported output extensions are `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`,
 `.tiff`, and `.exr`. Use `--engine CYCLES`, `--resolution-x`,

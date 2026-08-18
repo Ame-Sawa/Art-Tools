@@ -42,7 +42,8 @@ from cli_anything.blender.core import preview as preview_mod
 from cli_anything.blender.core.fbx import (
     generate_fbx_render_script, render_fbx, render_fbx_multi_angle,
     generate_fbx_smart_uv_script, generate_fbx_smart_uv_validation_script,
-    export_fbx_smart_uv,
+    generate_fbx_auto_uniform_uv_script, export_fbx_smart_uv,
+    export_fbx_auto_uniform_uv, _validate_uniform_uv_angles,
 )
 from cli_anything.blender.utils import blender_backend
 from cli_anything.blender.core.session import Session
@@ -1442,3 +1443,32 @@ class TestFbxSmartUv:
         output_path.write_bytes(b"existing")
         with pytest.raises(FileExistsError):
             export_fbx_smart_uv(str(fbx_path), str(output_path))
+
+    def test_uniform_uv_script_is_valid_and_scores_quality(self, tmp_path):
+        script = generate_fbx_auto_uniform_uv_script(
+            str(tmp_path / "source.fbx"), str(tmp_path / "output.fbx"),
+            angle_candidates=[0.2, 0.35],
+        )
+        compile(script, "<fbx_auto_uniform_uv_script>", "exec")
+        assert "bpy.ops.uv.smart_project" in script
+        assert "stretch_p95" in script
+        assert "density_log_std" in script
+        assert "FBX_UNIFORM_UV_RESULT" in script
+        assert "while len(obj.data.uv_layers) > 0" in script
+
+    def test_uniform_uv_angles_are_sorted_and_validated(self):
+        assert _validate_uniform_uv_angles([0.35, 0.2, 0.35]) == (0.2, 0.35)
+        with pytest.raises(ValueError, match="angle candidate"):
+            _validate_uniform_uv_angles([])
+        with pytest.raises(ValueError, match="angle candidate"):
+            _validate_uniform_uv_angles([0.0])
+        with pytest.raises(ValueError, match="angle candidate"):
+            _validate_uniform_uv_angles([4.0])
+
+    def test_uniform_uv_rejects_existing_output_without_overwrite(self, tmp_path):
+        fbx_path = tmp_path / "model.fbx"
+        output_path = tmp_path / "model_uniform_uv.fbx"
+        fbx_path.write_bytes(b"placeholder")
+        output_path.write_bytes(b"existing")
+        with pytest.raises(FileExistsError):
+            export_fbx_auto_uniform_uv(str(fbx_path), str(output_path))

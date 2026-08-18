@@ -1,7 +1,7 @@
 interface:
   display_name: "Blender CLI Workflow"
-  short_description: "Use the repo Blender CLI for 3D workflows"
-  default_prompt: "Use $cli-anything-blender to create, edit, render, preview, or process a Blender scene through the repository CLI."
+  short_description: "Automate Blender, FBX, UV, and preview workflows"
+  default_prompt: "Use $cli-anything-blender to process Blender or FBX assets, including uniform-checkerboard UV re-unwrapping and validation."
 
 policy:
   allow_implicit_invocation: true

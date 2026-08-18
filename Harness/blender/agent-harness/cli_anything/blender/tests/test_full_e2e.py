@@ -22,7 +22,7 @@ from cli_anything.blender.core.modifiers import add_modifier, list_modifiers
 from cli_anything.blender.core.lighting import add_camera, add_light, set_camera, set_light, list_cameras, list_lights
 from cli_anything.blender.core.animation import add_keyframe, set_frame_range, set_fps, list_keyframes
 from cli_anything.blender.core.render import set_render_settings, render_scene, generate_bpy_script, get_render_settings
-from cli_anything.blender.core.fbx import export_fbx_smart_uv
+from cli_anything.blender.core.fbx import export_fbx_smart_uv, export_fbx_auto_uniform_uv
 from cli_anything.blender.core import preview as preview_mod
 from cli_anything.blender.core.session import Session
 from cli_anything.blender.utils.bpy_gen import generate_full_script
@@ -1336,3 +1336,20 @@ class TestFbxSmartUvE2E:
         result = export_fbx_smart_uv(source, overwrite_source=True, timeout=240)
         assert result["output_fbx"] == os.path.abspath(source)
         assert os.path.getsize(source) == result["file_size"]
+
+    def test_auto_uniform_uv_selects_candidate_and_preserves_roundtrip(self, tmp_dir):
+        source = os.path.join(tmp_dir, "uniform_source.fbx")
+        output_path = os.path.join(tmp_dir, "uniform_output.fbx")
+        _create_smart_uv_fixture(source)
+
+        result = export_fbx_auto_uniform_uv(
+            source, output_path, angle_candidates=[0.2, 0.35], timeout=240,
+        )
+        assert result["output_fbx"] == os.path.abspath(output_path)
+        assert os.path.isfile(output_path)
+        assert result["objective"] == "uniform-checker"
+        assert result["selected_angle_limit_radians"] in {0.2, 0.35}
+        assert len(result["candidates"]) == 2
+        assert result["selected_metrics"]["stretch_p95"] >= 1.0
+        assert result["selected_metrics"]["density_log_std"] >= 0.0
+        assert result["validation"]["errors"] == []

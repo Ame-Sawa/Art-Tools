@@ -17,6 +17,7 @@ Usage:
 import sys
 import os
 import json
+import math
 import shlex
 import shutil
 import subprocess
@@ -1008,6 +1009,33 @@ def fbx_smart_uv_project(fbx_path, output_path, overwrite, overwrite_source, tim
     output(result, f"Smart UV Project FBX exported: {result['output_fbx']}")
 
 
+@fbx_group.command("auto-uniform-uv")
+@click.argument("fbx_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--output", "output_path", type=click.Path(dir_okay=False), default=None,
+              help="Explicit output FBX path; defaults to INPUT with a _uniform_uv suffix.")
+@click.option("--overwrite", is_flag=True,
+              help="Allow replacing an existing explicit or default output file.")
+@click.option("--overwrite-source", is_flag=True,
+              help="Replace INPUT.fbx after validation; cannot be combined with --output.")
+@click.option("--timeout", type=int, default=300, show_default=True,
+              help="Blender timeout in seconds.")
+@click.option("--angle-deg", "angle_degrees", multiple=True, type=float,
+              help="Candidate Smart UV angle in degrees; repeat to override defaults.")
+@handle_error
+def fbx_auto_uniform_uv(fbx_path, output_path, overwrite, overwrite_source, timeout,
+                         angle_degrees):
+    """Search Smart UV angles and export the result with the most uniform checkerboard."""
+    angle_candidates = [math.radians(value) for value in angle_degrees] if angle_degrees else None
+    result = fbx_mod.export_fbx_auto_uniform_uv(
+        fbx_path, output_path,
+        overwrite=overwrite,
+        overwrite_source=overwrite_source,
+        timeout=timeout,
+        angle_candidates=angle_candidates,
+    )
+    output(result, f"Auto uniform UV FBX exported: {result['output_fbx']}")
+
+
 @cli.group("preview")
 def preview_group():
     """Preview bundle capture and inspection."""
@@ -1219,7 +1247,7 @@ def repl(project_path):
         "light":     "add|set|list",
         "animation": "keyframe|remove-keyframe|frame-range|fps|list-keyframes",
         "render":    "settings|info|presets|execute|script",
-        "fbx":       "render|material-colors|multi-angle|smart-uv-project",
+        "fbx":       "render|material-colors|multi-angle|smart-uv-project|auto-uniform-uv",
         "preview":   "recipes|capture|latest|live start|push|status|stop",
         "session":   "status|undo|redo|history",
         "help":      "show this help",

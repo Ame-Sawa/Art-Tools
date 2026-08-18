@@ -1,9 +1,10 @@
 """Headless FBX import, UV processing, export, and still-render helpers."""
 
 import json
+import math
 import os
 import tempfile
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 
 MULTI_ANGLE_VIEWS = ("front", "back", "left", "right", "top", "bottom", "perspective")
@@ -20,6 +21,7 @@ SMART_UV_DEFAULTS = {
     "correct_aspect": True,
     "scale_to_bounds": False,
 }
+UNIFORM_UV_DEFAULT_ANGLE_DEGREES = (10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 66.0)
 
 
 def render_fbx(fbx_path: str, output_path: str, **options) -> Dict[str, object]:
@@ -240,6 +242,25 @@ def _validate_smart_uv_options(options: Dict[str, object]) -> Dict[str, object]:
     return values
 
 
+def _validate_uniform_uv_angles(angle_candidates: Optional[Sequence[float]]) -> tuple[float, ...]:
+    """Validate and normalize the angle candidates used by auto-unwrapping."""
+    if angle_candidates is None:
+        values = [math.radians(value) for value in UNIFORM_UV_DEFAULT_ANGLE_DEGREES]
+    else:
+        values = [float(value) for value in angle_candidates]
+    if not values:
+        raise ValueError("At least one angle candidate is required.")
+    if any(not math.isfinite(value) or not 0.0 < value <= math.pi for value in values):
+        raise ValueError("Each angle candidate must be finite and between 0 and pi radians.")
+    return tuple(sorted(set(values)))
+
+
+def _uniform_uv_output_path(fbx_path: str) -> str:
+    directory, filename = os.path.split(fbx_path)
+    stem, extension = os.path.splitext(filename)
+    return os.path.join(directory, f"{stem}_uniform_uv{extension}")
+
+
 def _smart_uv_output_path(fbx_path: str) -> str:
     directory, filename = os.path.split(fbx_path)
     stem, extension = os.path.splitext(filename)
@@ -351,6 +372,220 @@ def export_fbx_smart_uv(
     finally:
         if os.path.exists(staging_path):
             os.unlink(staging_path)
+
+
+def export_fbx_auto_uniform_uv(
+    fbx_path: str,
+    output_path: Optional[str] = None,
+    *,
+    overwrite: bool = False,
+    overwrite_source: bool = False,
+    timeout: int = 300,
+    angle_candidates: Optional[Sequence[float]] = None,
+) -> Dict[str, object]:
+    """Auto-select a Smart UV angle for uniform checkerboard distortion."""
+    fbx_path = os.path.abspath(fbx_path)
+    if not os.path.isfile(fbx_path):
+        raise FileNotFoundError(f"FBX file not found: {fbx_path}")
+    if os.path.splitext(fbx_path)[1].lower() != ".fbx":
+        raise ValueError(f"Expected an .fbx file: {fbx_path}")
+    if timeout < 1:
+        raise ValueError("Blender timeout must be positive.")
+    if overwrite_source and output_path is not None:
+        raise ValueError("--overwrite-source cannot be combined with --output.")
+
+    if overwrite_source:
+        final_path = fbx_path
+    elif output_path is None:
+        final_path = _uniform_uv_output_path(fbx_path)
+    else:
+        final_path = os.path.abspath(output_path)
+
+    if os.path.splitext(final_path)[1].lower() != ".fbx":
+        raise ValueError(f"Expected an .fbx output path: {final_path}")
+    if _same_path(final_path, fbx_path) and not overwrite_source:
+        raise ValueError("Refusing to overwrite the source FBX. Use overwrite_source=True.")
+    if os.path.exists(final_path) and not (overwrite or overwrite_source):
+        raise FileExistsError(f"Output file exists: {final_path}. Use overwrite=True.")
+
+    angles = _validate_uniform_uv_angles(angle_candidates)
+    output_dir = os.path.dirname(final_path) or os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+    temp_handle, staging_path = tempfile.mkstemp(
+        prefix=f".{os.path.splitext(os.path.basename(final_path))[0]}_",
+        suffix=".fbx",
+        dir=output_dir,
+    )
+    os.close(temp_handle)
+    os.unlink(staging_path)
+
+    try:
+        export_script = generate_fbx_auto_uniform_uv_script(
+            fbx_path, staging_path, angle_candidates=angles,
+        )
+        export_run = _run_blender_script(export_script, timeout, "FBX auto uniform UV export")
+        if not os.path.isfile(staging_path):
+            raise RuntimeError(f"Blender produced no FBX output: {staging_path}")
+        export_summary = _parse_script_marker(export_run["stdout"], "FBX_UNIFORM_UV_RESULT")
+
+        validation_script = generate_fbx_smart_uv_validation_script(fbx_path, staging_path)
+        validation_run = _run_blender_script(validation_script, timeout, "FBX round-trip validation")
+        validation = _parse_script_marker(
+            validation_run["stdout"], "FBX_SMART_UV_VALIDATION",
+        )
+        if not validation.get("ok"):
+            raise RuntimeError(f"FBX round-trip validation failed: {validation}")
+
+        os.replace(staging_path, final_path)
+        selected = export_summary["selected_candidate"]
+        return {
+            "source_fbx": fbx_path,
+            "output_fbx": os.path.abspath(final_path),
+            "file_size": os.path.getsize(final_path),
+            "blender_version": export_summary.get("blender_version"),
+            "mesh_objects": export_summary["mesh_objects"],
+            "unique_mesh_datablocks": export_summary["unique_mesh_datablocks"],
+            "uv_loop_count": export_summary["uv_loop_count"],
+            "source_profile": export_summary["source_profile"],
+            "objective": "uniform-checker",
+            "selected_angle_limit_radians": selected["angle_limit_radians"],
+            "selected_angle_limit_degrees": selected["angle_limit_degrees"],
+            "selected_metrics": selected["metrics"],
+            "candidates": export_summary["candidates"],
+            "validation": {
+                key: value for key, value in validation.items() if key != "ok"
+            },
+            "smart_uv_options": export_summary["smart_uv_options"],
+        }
+    finally:
+        if os.path.exists(staging_path):
+            os.unlink(staging_path)
+
+
+def generate_fbx_auto_uniform_uv_script(
+    fbx_path: str,
+    output_path: str,
+    *,
+    angle_candidates: Optional[Sequence[float]] = None,
+) -> str:
+    """Generate the Blender script for angle search and uniformity scoring."""
+    angles = _validate_uniform_uv_angles(angle_candidates)
+    options = dict(SMART_UV_DEFAULTS)
+    config = repr({
+        "fbx_path": os.path.abspath(fbx_path),
+        "output_path": os.path.abspath(output_path),
+        "angle_candidates": angles,
+        "smart_uv_options": options,
+    })
+    return "\n".join([
+        "import bpy", "import json", "import inspect", "import math",
+        "from io_scene_fbx import import_fbx, parse_fbx",
+        "from io_scene_fbx.fbx_utils import RIGHT_HAND_AXES",
+        f"CONFIG = {config}",
+        "_light_source = inspect.getsource(import_fbx.blen_read_light)",
+        "if 'lamp.cycles.cast_shadow = lamp.use_shadow' in _light_source:",
+        "    _light_source = _light_source.replace('        lamp.cycles.cast_shadow = lamp.use_shadow', '        try:\\n            lamp.cycles.cast_shadow = lamp.use_shadow\\n        except AttributeError:\\n            pass')",
+        "    _light_namespace = dict(import_fbx.__dict__)",
+        "    exec(compile(_light_source, '<fbx_light_compat>', 'exec'), _light_namespace)",
+        "    import_fbx.blen_read_light = _light_namespace['blen_read_light']",
+        "def source_profile(path):",
+        "    root, version = parse_fbx.parse(path)",
+        "    settings = import_fbx.elem_find_first(root, b'GlobalSettings')",
+        "    props = import_fbx.elem_find_first(settings, b'Properties70') if settings else None",
+        "    if props is None: raise RuntimeError('FBX has no GlobalSettings/Properties70 block.')",
+        "    unit = float(import_fbx.elem_props_get_number(props, b'UnitScaleFactor', 1.0))",
+        "    up = (int(import_fbx.elem_props_get_integer(props, b'UpAxis', 2)), int(import_fbx.elem_props_get_integer(props, b'UpAxisSign', 1)))",
+        "    forward = (int(import_fbx.elem_props_get_integer(props, b'FrontAxis', 1)), int(import_fbx.elem_props_get_integer(props, b'FrontAxisSign', 1)))",
+        "    coord = (int(import_fbx.elem_props_get_integer(props, b'CoordAxis', 0)), int(import_fbx.elem_props_get_integer(props, b'CoordAxisSign', 1)))",
+        "    axis_key = (up, forward, coord)",
+        "    axis_map = {value: key for key, value in RIGHT_HAND_AXES.items()}",
+        "    if axis_key not in axis_map: raise RuntimeError('Source FBX axis system is not representable by Blender FBX exporter: ' + repr(axis_key))",
+        "    axis_up, axis_forward = axis_map[axis_key]",
+        "    if unit <= 0: raise RuntimeError('Source FBX UnitScaleFactor must be positive.')",
+        "    return {'axis_up': axis_up, 'axis_forward': axis_forward, 'unit_scale_factor': unit, 'version': version}",
+        "def weighted_percentile(values, weights, fraction):",
+        "    if not values: raise RuntimeError('UV quality analysis produced no valid triangles.')",
+        "    pairs = sorted(zip(values, weights), key=lambda item: item[0])",
+        "    target = sum(weights) * fraction; running = 0.0",
+        "    for value, weight in pairs:",
+        "        running += weight",
+        "        if running >= target: return value",
+        "    return pairs[-1][0]",
+        "def triangle_quality(obj, uv, li0, li1, li2):",
+        "    data = obj.data; indices = (li0, li1, li2)",
+        "    points = [obj.matrix_world @ data.vertices[data.loops[li].vertex_index].co for li in indices]",
+        "    edge1 = points[1] - points[0]; edge2 = points[2] - points[0]",
+        "    area3 = edge1.cross(edge2).length * 0.5",
+        "    if area3 <= 1e-12: return None",
+        "    x_axis = edge1.normalized(); y_axis = edge1.cross(edge2).normalized().cross(x_axis).normalized()",
+        "    x1 = edge1.length; x2 = edge2.dot(x_axis); y2 = edge2.dot(y_axis)",
+        "    if abs(x1 * y2) <= 1e-12: return None",
+        "    uv0, uv1, uv2 = [uv.data[li].uv for li in indices]",
+        "    du1 = uv1 - uv0; du2 = uv2 - uv0",
+        "    a00 = du1.x / x1; a01 = du2.x / y2 - du1.x * x2 / (x1 * y2)",
+        "    a10 = du1.y / x1; a11 = du2.y / y2 - du1.y * x2 / (x1 * y2)",
+        "    aa = a00 * a00 + a10 * a10; dd = a01 * a01 + a11 * a11; bb = a00 * a01 + a10 * a11",
+        "    trace = aa + dd; discriminant = max((aa - dd) * (aa - dd) + 4.0 * bb * bb, 0.0)",
+        "    largest = max((trace + math.sqrt(discriminant)) * 0.5, 0.0)",
+        "    smallest = max((trace - math.sqrt(discriminant)) * 0.5, 0.0)",
+        "    if smallest <= 1e-20 or largest <= 1e-20: return None",
+        "    determinant = abs(a00 * a11 - a01 * a10)",
+        "    if not all(math.isfinite(value) for value in (largest, smallest, determinant)): return None",
+        "    return {'stretch': math.sqrt(largest / smallest), 'density': math.sqrt(determinant), 'area': area3}",
+        "def quality_metrics():",
+        "    stretch_values = []; stretch_weights = []; density_logs = []; density_weights = []; invalid = 0",
+        "    for obj in unique_meshes:",
+        "        uv = obj.data.uv_layers.active",
+        "        if uv is None or len(uv.data) != len(obj.data.loops): raise RuntimeError('Uniform UV Project produced an invalid UV layer for ' + obj.name)",
+        "        for polygon in obj.data.polygons:",
+        "            loops = list(polygon.loop_indices)",
+        "            for index in range(1, len(loops) - 1):",
+        "                result = triangle_quality(obj, uv, loops[0], loops[index], loops[index + 1])",
+        "                if result is None: invalid += 1; continue",
+        "                stretch_values.append(result['stretch']); stretch_weights.append(result['area'])",
+        "                density_logs.append(math.log(max(result['density'], 1e-30))); density_weights.append(result['area'])",
+        "    if not stretch_values or not density_logs: raise RuntimeError('Uniform UV Project produced no measurable UV triangles.')",
+        "    log_stretch = [math.log(max(value, 1.0)) for value in stretch_values]",
+        "    stretch_p95 = math.exp(weighted_percentile(log_stretch, stretch_weights, 0.95))",
+        "    stretch_max = max(stretch_values)",
+        "    weight_total = sum(density_weights); density_mean = sum(value * weight for value, weight in zip(density_logs, density_weights)) / weight_total",
+        "    density_variance = sum(weight * (value - density_mean) ** 2 for value, weight in zip(density_logs, density_weights)) / weight_total",
+        "    return {'stretch_p95': stretch_p95, 'stretch_max': stretch_max, 'density_log_std': math.sqrt(max(density_variance, 0.0)), 'invalid_triangles': invalid}",
+        "def unwrap(angle):",
+        "    options = dict(CONFIG['smart_uv_options']); options['angle_limit'] = angle",
+        "    for obj in unique_meshes:",
+        "        for candidate in bpy.context.view_layer.objects: candidate.select_set(False)",
+        "        obj.select_set(True); bpy.context.view_layer.objects.active = obj",
+        "        if bpy.context.object and bpy.context.object.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')",
+        "        bpy.ops.object.mode_set(mode='EDIT'); bpy.ops.mesh.select_all(action='SELECT')",
+        "        bpy.ops.uv.smart_project(**options); bpy.ops.object.mode_set(mode='OBJECT')",
+        "profile = source_profile(CONFIG['fbx_path'])",
+        "bpy.ops.wm.read_factory_settings(use_empty=True)",
+        "bpy.ops.import_scene.fbx(filepath=CONFIG['fbx_path'], use_manual_orientation=False, use_custom_normals=True, use_anim=True, use_custom_props=True, ignore_leaf_bones=False, automatic_bone_orientation=False, use_prepost_rot=True)",
+        "meshes = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']",
+        "if not meshes: raise RuntimeError('FBX import produced no mesh objects.')",
+        "seen_data = set(); unique_meshes = []",
+        "for obj in meshes:",
+        "    data_key = obj.data.as_pointer()",
+        "    if data_key in seen_data: continue",
+        "    seen_data.add(data_key); unique_meshes.append(obj)",
+        "    while len(obj.data.uv_layers) > 0: obj.data.uv_layers.remove(obj.data.uv_layers[0])",
+        "    obj.data.uv_layers.new(name='map1')",
+        "candidates = []",
+        "for angle in CONFIG['angle_candidates']:",
+        "    unwrap(angle); metrics = quality_metrics()",
+        "    candidates.append({'angle_limit_radians': angle, 'angle_limit_degrees': math.degrees(angle), 'metrics': metrics})",
+        "valid_candidates = [item for item in candidates if item['metrics']['invalid_triangles'] == 0]",
+        "if not valid_candidates: raise RuntimeError('All uniform UV candidates produced invalid UV triangles.')",
+        "selected = min(valid_candidates, key=lambda item: (item['metrics']['stretch_p95'], item['metrics']['stretch_max'], item['metrics']['density_log_std'], item['angle_limit_radians']))",
+        "unwrap(selected['angle_limit_radians']); final_metrics = quality_metrics()",
+        "bpy.context.scene.unit_settings.system = 'METRIC'",
+        "bpy.context.scene.unit_settings.scale_length = profile['unit_scale_factor'] / 100.0",
+        "bpy.ops.export_scene.fbx(filepath=CONFIG['output_path'], check_existing=False, use_selection=False, use_visible=False, use_active_collection=False, global_scale=100.0 / profile['unit_scale_factor'], apply_unit_scale=True, apply_scale_options='FBX_SCALE_UNITS', use_space_transform=True, bake_space_transform=False, object_types={'EMPTY', 'CAMERA', 'LIGHT', 'ARMATURE', 'MESH', 'OTHER'}, use_mesh_modifiers=False, use_mesh_modifiers_render=False, use_subsurf=False, add_leaf_bones=False, bake_anim=True, bake_anim_use_all_bones=True, bake_anim_use_nla_strips=True, bake_anim_use_all_actions=True, bake_anim_force_startend_keying=True, bake_anim_step=1.0, bake_anim_simplify_factor=1.0, use_custom_props=True, use_metadata=True, path_mode='AUTO', axis_forward=profile['axis_forward'], axis_up=profile['axis_up'])",
+        "selected_options = dict(CONFIG['smart_uv_options']); selected_options['angle_limit'] = selected['angle_limit_radians']",
+        "result = {'blender_version': bpy.app.version_string, 'mesh_objects': len(meshes), 'unique_mesh_datablocks': len(unique_meshes), 'uv_loop_count': sum(len(obj.data.uv_layers.active.data) for obj in unique_meshes), 'source_profile': profile, 'smart_uv_options': selected_options, 'objective': 'uniform-checker', 'candidates': candidates, 'selected_candidate': {'angle_limit_radians': selected['angle_limit_radians'], 'angle_limit_degrees': selected['angle_limit_degrees'], 'metrics': final_metrics}}",
+        "print('FBX_UNIFORM_UV_RESULT=' + json.dumps(result, sort_keys=True))",
+    ])
 
 
 def generate_fbx_smart_uv_script(
