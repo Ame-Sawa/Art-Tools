@@ -122,9 +122,13 @@ initialize_windows.bat "H:\Blender5.1\blender.exe"
 ```text
 .venv\
 .tmp\
-.pip-cache\
 .env.local
 ```
+
+`.tmp` 仅在创建或修复虚拟环境、安装 CLI 时按需创建。
+
+重复运行初始化脚本时，会优先复用 `.env.local` 中仍然有效的 Blender 路径，
+并跳过已经可用的虚拟环境、CLI 安装和重复验证。
 
 初始化完成后，无需激活虚拟环境即可调用 CLI：
 
@@ -132,3 +136,19 @@ initialize_windows.bat "H:\Blender5.1\blender.exe"
 .\.venv\Scripts\cli-anything-blender.exe --help
 .\.venv\Scripts\cli-anything-blender.exe scene profiles
 ```
+
+## Uniform UV / AutoUV Windows GUI
+
+如果更适合使用文件选择器和拖放，可以双击 harness 目录中的：
+
+```text
+launch_blender_uv_gui.bat
+```
+
+该 GUI 只支持批量选择 FBX，按“参数 → 输出方式 → 批次文件”的顺序操作，选择
+Blender Uniform UV 或 Ministry of Flat AutoUV 后统一调用 `fbx auto-uv --algorithm ...`
+完成导出与 FBX round-trip 校验。主窗口只显示待处理文件数量；批量导入窗口支持
+多选文件、删除列表项和预览预计输出路径，批次内使用同一种算法和参数。AutoUV
+模式还可以选择 `UnWrapConsole3.exe` 并设置常用的分辨率、UDIM、硬边分离、重叠和
+世界尺度参数。首次启动会在虚拟环境中安装 PySide6；默认算法为 AutoUV，默认输出
+模式为覆盖源文件，也可以添加固定 `_uv`/`_autouv` 后缀或选择批量输出目录。

@@ -1,0 +1,5 @@
+第三方组件：Ministry of Flat / UnWrapConsole3.exe
+
+该文件由用户提供并获授权用于本机及 Harness 工具集成。
+Harness 仅通过命令行调用该组件，不包含 UnWrap3.exe GUI 版本。
+如需使用其他版本，可通过 --unwrap-exe 或 MINISTRY_OF_FLAT_EXE 指定。

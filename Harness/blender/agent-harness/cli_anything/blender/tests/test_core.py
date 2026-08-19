@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 import pytest
 
@@ -39,11 +41,16 @@ from cli_anything.blender.core.render import (
     render_scene, RENDER_PRESETS, VALID_ENGINES,
 )
 from cli_anything.blender.core import preview as preview_mod
+from cli_anything.blender.core import fbx as fbx_mod
 from cli_anything.blender.core.fbx import (
     generate_fbx_render_script, render_fbx, render_fbx_multi_angle,
     generate_fbx_smart_uv_script, generate_fbx_smart_uv_validation_script,
     generate_fbx_auto_uniform_uv_script, export_fbx_smart_uv,
-    export_fbx_auto_uniform_uv, _validate_uniform_uv_angles,
+    export_fbx_auto_uniform_uv, generate_fbx_auto_uv_script, export_fbx_auto_uv,
+    export_fbx_auto_uv_batch,
+    resolve_ministry_of_flat_executable, _suffix_output_path, _validate_uniform_uv_angles,
+    _validate_ministry_of_flat_options, _score_topology_metrics,
+    _resolve_topology_prefilter_level, TOPOLOGY_RISK_VERSION,
 )
 from cli_anything.blender.utils import blender_backend
 from cli_anything.blender.core.session import Session
@@ -1396,6 +1403,364 @@ class TestFbxRender:
             render_fbx_multi_angle(str(fbx_path), str(tmp_path / "renders"), views=["diagonal"])
 
 
+class TestFbxAutoUv:
+    def test_blender_script_temp_files_are_utf8(self, monkeypatch):
+        observed = {}
+
+        def fake_render_script(script_path, timeout=300):
+            observed["source"] = Path(script_path).read_text(encoding="utf-8")
+            observed["timeout"] = timeout
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(blender_backend, "render_script", fake_render_script)
+        result = blender_backend.run_blender_script(
+            "print('H:\\HDownload\\新建文件夹')", timeout=17,
+        )
+
+        assert result["returncode"] == 0
+        assert "新建文件夹" in observed["source"]
+        assert observed["timeout"] == 17
+
+    def test_generated_auto_uv_script_is_valid_python(self, tmp_path):
+        script = generate_fbx_auto_uv_script(
+            str(tmp_path / "source.fbx"),
+            str(tmp_path / "output.fbx"),
+            executable_path=str(tmp_path / "UnWrapConsole3.exe"),
+            auto_uv_options={"resolution": 2048, "udims": 2},
+        )
+        compile(script, "<fbx_auto_uv_script>", "exec")
+        assert "subprocess.run" in script
+        assert "'-resolution'" in script
+        assert "'-worldscale'" in script
+        assert "uv_layers.active" in script
+        assert "normalize_uv_layer_to_single_tile" in script
+        assert "single_tile_margin" in script
+        assert "copy_uv_same_topology" in script
+        assert "process_mesh(obj, temp_root, index)" in script
+        assert script.count("run_unwrap(") == 2  # definition plus the one original-topology call
+        assert "quads_convert_to_tris" not in script
+        assert "make_triangulated_copy" not in script
+        assert "copy_uv_from_triangulated_mesh" not in script
+        assert "fallback_input_path" not in script
+        assert "fallback_output_path" not in script
+        assert "fallback_used" not in script
+        assert "proactive_fallback" not in script
+        assert "triangulated_fallback_meshes" not in script
+        assert "analyze_topology" in script
+        assert "preflight_topology" in script
+        assert "FBX_AUTO_UV_PREFLIGHT" in script
+        assert "FBX_AUTO_UV_SKIP" in script
+        assert "file_timeout" in script
+        assert "processing_timeout" in script
+        assert "topology_risk_threshold" in script
+        assert "topology_risk_version" in script
+        assert "ngon_ratio" in script
+        assert "interior_non_manifold_edges" in script
+        assert "triggered_rules" in script
+        assert "terminate_process_tree" in script
+        assert "taskkill" in script
+        assert "subprocess.Popen" in script
+        assert "FBX_AUTO_UV_RESULT" in script
+        assert "bpy.ops.export_scene.fbx" in script
+
+    def test_generated_auto_uv_script_supports_prefilter_levels(self, tmp_path):
+        strict = generate_fbx_auto_uv_script(
+            str(tmp_path / "source.fbx"),
+            str(tmp_path / "output.fbx"),
+            executable_path=str(tmp_path / "UnWrapConsole3.exe"),
+            topology_prefilter_level="medium",
+        )
+        disabled = generate_fbx_auto_uv_script(
+            str(tmp_path / "source.fbx"),
+            str(tmp_path / "output.fbx"),
+            executable_path=str(tmp_path / "UnWrapConsole3.exe"),
+            topology_prefilter_level="off",
+        )
+        compile(strict, "<strict_auto_uv_script>", "exec")
+        compile(disabled, "<disabled_auto_uv_script>", "exec")
+        assert "'topology_prefilter_level': 'medium'" in strict
+        assert "'topology_prefilter_level': 'off'" in disabled
+
+    def test_topology_prefilter_level_legacy_compatibility_and_conflicts(self):
+        assert _resolve_topology_prefilter_level(None, None) == "high"
+        assert _resolve_topology_prefilter_level(None, True) == "high"
+        assert _resolve_topology_prefilter_level(None, False) == "off"
+        assert _resolve_topology_prefilter_level("medium", None) == "medium"
+        with pytest.raises(ValueError, match="conflicts"):
+            _resolve_topology_prefilter_level("high", True)
+
+    def test_topology_risk_v2_uses_highest_band_only(self):
+        metrics = {
+            "vertices": 0,
+            "polygons": 0,
+            "loops": 0,
+            "edges": 100,
+            "boundary_edges": 25,
+            "boundary_edge_ratio": 0.25,
+            "ngons": 25,
+            "ngon_ratio": 0.25,
+            "max_polygon_vertices": 13,
+            "duplicate_position_groups": 3,
+            "zero_area_faces": 0,
+            "interior_non_manifold_edges": 50,
+        }
+        result = _score_topology_metrics(metrics)
+        assert result["risk_version"] == TOPOLOGY_RISK_VERSION == 2
+        assert result["risk_level"] == "high"
+        codes = [rule["code"] for rule in result["triggered_rules"]]
+        assert "boundary_ratio_very_high" in codes
+        assert "boundary_ratio_high" not in codes
+        assert "ngon_ratio_very_high" in codes
+        assert "ngon_ratio_high" not in codes
+        assert "max_polygon_vertices_very_high" in codes
+        assert "max_polygon_vertices_high" not in codes
+        assert "max_polygon_vertices_elevated" not in codes
+
+    def test_topology_risk_v2_detects_small_open_ngon_mesh(self):
+        result = _score_topology_metrics({
+            "vertices": 356,
+            "polygons": 278,
+            "loops": 1122,
+            "edges": 623,
+            "boundary_edges": 124,
+            "boundary_edge_ratio": 0.199,
+            "ngons": 28,
+            "ngon_ratio": 28 / 278,
+            "max_polygon_vertices": 5,
+            "duplicate_position_groups": 0,
+            "zero_area_faces": 0,
+            "interior_non_manifold_edges": 0,
+        })
+        codes = {rule["code"] for rule in result["triggered_rules"]}
+        assert result["risk_level"] == "high"
+        assert "open_boundary_ngon_combo" in codes
+        assert "small_open_complex_mesh" in codes
+        assert result["ngon_ratio"] == pytest.approx(28 / 278)
+
+    def test_topology_risk_v2_low_mesh_can_still_have_basic_warning(self):
+        result = _score_topology_metrics({
+            "vertices": 100,
+            "polygons": 80,
+            "loops": 320,
+            "edges": 200,
+            "boundary_edges": 10,
+            "boundary_edge_ratio": 0.05,
+            "ngons": 2,
+            "ngon_ratio": 0.025,
+            "max_polygon_vertices": 4,
+            "duplicate_position_groups": 0,
+            "zero_area_faces": 0,
+            "interior_non_manifold_edges": 0,
+        })
+        assert result["risk_score"] == 0
+        assert result["risk_level"] == "low"
+
+    def test_auto_uv_options_are_validated(self):
+        with pytest.raises(ValueError, match="resolution"):
+            _validate_ministry_of_flat_options({"resolution": 0})
+        with pytest.raises(ValueError, match="aspect"):
+            _validate_ministry_of_flat_options({"aspect": 0})
+        with pytest.raises(ValueError, match="UDIM"):
+            _validate_ministry_of_flat_options({"udims": 0})
+
+    def test_auto_uv_resolves_explicit_executable(self, tmp_path):
+        executable = tmp_path / "UnWrapConsole3.exe"
+        executable.write_bytes(b"placeholder")
+        assert resolve_ministry_of_flat_executable(str(executable)) == str(executable.resolve())
+
+    def test_auto_uv_resolves_harness_bundled_executable(self):
+        resolved = Path(resolve_ministry_of_flat_executable())
+        assert resolved.name == "UnWrapConsole3.exe"
+        assert resolved.parent == Path(fbx_mod.__file__).resolve().parents[1] / "third_party" / "MinistryOfFlat"
+
+    def test_auto_uv_rejects_source_overwrite_without_explicit_mode(self, tmp_path):
+        source = tmp_path / "model.fbx"
+        source.write_bytes(b"placeholder")
+        with pytest.raises(ValueError, match="source FBX"):
+            export_fbx_auto_uv(str(source), str(source), executable_path=str(source))
+
+    def test_auto_uv_rejects_existing_output_without_overwrite(self, tmp_path):
+        source = tmp_path / "model.fbx"
+        output = tmp_path / "model_autouv.fbx"
+        executable = tmp_path / "UnWrapConsole3.exe"
+        source.write_bytes(b"placeholder")
+        output.write_bytes(b"existing")
+        executable.write_bytes(b"placeholder")
+        with pytest.raises(FileExistsError):
+            export_fbx_auto_uv(
+                str(source),
+                str(output),
+                executable_path=str(executable),
+            )
+
+    def test_unified_auto_uv_rejects_algorithm_specific_options(self, tmp_path):
+        source = tmp_path / "model.fbx"
+        source.write_bytes(b"placeholder")
+        with pytest.raises(ValueError, match="Uniform UV options"):
+            export_fbx_auto_uv(str(source), algorithm="autouv", angle_candidates=[0.3])
+        with pytest.raises(ValueError, match="Ministry of Flat options"):
+            export_fbx_auto_uv(
+                str(source),
+                algorithm="uniform",
+                executable_path=str(tmp_path / "UnWrapConsole3.exe"),
+            )
+
+    def test_auto_uv_batch_deduplicates_and_rejects_multiple_exact_outputs(self, tmp_path):
+        source_a = tmp_path / "a.fbx"
+        source_b = tmp_path / "b.fbx"
+        source_a.write_bytes(b"placeholder")
+        source_b.write_bytes(b"placeholder")
+        with pytest.raises(ValueError, match="single FBX input"):
+            export_fbx_auto_uv_batch(
+                [str(source_a), str(source_b), str(source_a)],
+                output_path=str(tmp_path / "out.fbx"),
+            )
+
+    def test_auto_uv_batch_continues_after_one_file_failure(self, tmp_path, monkeypatch):
+        source_a = tmp_path / "a.fbx"
+        source_b = tmp_path / "b.fbx"
+        source_a.write_bytes(b"placeholder")
+        source_b.write_bytes(b"placeholder")
+
+        def fake_export(source_path, *args, **kwargs):
+            if os.path.basename(source_path) == "a.fbx":
+                raise RuntimeError("simulated AutoUV failure")
+            return {"output_fbx": str(tmp_path / "b_autouv.fbx")}
+
+        monkeypatch.setattr(fbx_mod, "export_fbx_auto_uv", fake_export)
+        events = []
+        result = export_fbx_auto_uv_batch(
+            [str(source_a), str(source_b)],
+            suffix="_autouv",
+            progress_callback=events.append,
+            jobs=1,
+        )
+
+        assert result["total"] == 2
+        assert result["success_count"] == 1
+        assert result["failure_count"] == 1
+        assert result["skipped_count"] == 0
+        assert result["results"][0]["ok"] is False
+        assert "simulated AutoUV failure" in result["results"][0]["error"]
+        assert result["results"][1]["ok"] is True
+        assert [event["event"] for event in events] == [
+            "batch_started",
+            "file_started",
+            "file_finished",
+            "file_started",
+            "file_finished",
+            "batch_finished",
+        ]
+        assert events[1]["index"] == 1
+        assert events[3]["index"] == 2
+        assert events[2]["ok"] is False
+        assert events[4]["ok"] is True
+        assert events[-1]["success_count"] == 1
+        assert events[-1]["failure_count"] == 1
+        assert events[-1]["skipped_count"] == 0
+
+    def test_auto_uv_batch_reports_topology_skips_and_continues(self, tmp_path, monkeypatch):
+        source_a = tmp_path / "high-risk.fbx"
+        source_b = tmp_path / "normal.fbx"
+        source_a.write_bytes(b"placeholder")
+        source_b.write_bytes(b"placeholder")
+
+        def fake_export(source_path, *args, **kwargs):
+            if os.path.basename(source_path) == "high-risk.fbx":
+                return {
+                    "source_fbx": str(source_path),
+                    "skipped": True,
+                    "skip_reason": "topology_risk",
+                    "preflight": {
+                        "risk_score": 15,
+                        "risk_level": "high",
+                        "highest_risk_mesh": "high-risk",
+                        "reasons": ["vertices >= 3500"],
+                    },
+                }
+            return {"output_fbx": str(tmp_path / "normal_autouv.fbx")}
+
+        monkeypatch.setattr(fbx_mod, "export_fbx_auto_uv", fake_export)
+        events = []
+        result = export_fbx_auto_uv_batch(
+            [str(source_a), str(source_b)],
+            suffix="_autouv",
+            progress_callback=events.append,
+            jobs=1,
+        )
+
+        assert result["success_count"] == 1
+        assert result["failure_count"] == 0
+        assert result["skipped_count"] == 1
+        assert result["results"][0]["skipped"] is True
+        assert result["results"][1]["ok"] is True
+        skipped_event = events[2]
+        assert skipped_event["event"] == "file_finished"
+        assert skipped_event["ok"] is False
+        assert skipped_event["skipped"] is True
+        assert skipped_event["risk_score"] == 15
+        assert events[-1]["event"] == "batch_finished"
+        assert events[-1]["success_count"] == 1
+        assert events[-1]["failure_count"] == 0
+        assert events[-1]["skipped_count"] == 1
+
+    def test_auto_uv_batch_parallel_limits_workers_and_preserves_result_order(self, tmp_path, monkeypatch):
+        sources = []
+        for name in ("a.fbx", "b.fbx", "c.fbx", "d.fbx"):
+            path = tmp_path / name
+            path.write_bytes(b"placeholder")
+            sources.append(path)
+
+        state = {"active": 0, "maximum": 0}
+        lock = threading.Lock()
+
+        def fake_export(source_path, *args, **kwargs):
+            with lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            time.sleep(0.03 if os.path.basename(source_path) in {"a.fbx", "c.fbx"} else 0.01)
+            with lock:
+                state["active"] -= 1
+            return {"output_fbx": str(tmp_path / (Path(source_path).stem + "_autouv.fbx"))}
+
+        monkeypatch.setattr(fbx_mod, "export_fbx_auto_uv", fake_export)
+        events = []
+        result = export_fbx_auto_uv_batch(
+            [str(path) for path in sources],
+            suffix="_autouv",
+            jobs=2,
+            progress_callback=events.append,
+        )
+
+        assert state["maximum"] == 2
+        assert result["jobs"] == 2
+        assert result["effective_jobs"] == 2
+        assert [Path(item["input_fbx"]).name for item in result["results"]] == [
+            "a.fbx", "b.fbx", "c.fbx", "d.fbx",
+        ]
+        finished = [event for event in events if event["event"] == "file_finished"]
+        assert [event["completed_count"] for event in finished] == [1, 2, 3, 4]
+        assert events[0]["event"] == "batch_started"
+        assert events[-1]["event"] == "batch_finished"
+
+    def test_auto_uv_batch_rejects_duplicate_parallel_outputs_and_invalid_jobs(self, tmp_path, monkeypatch):
+        source_a = tmp_path / "one" / "asset.fbx"
+        source_b = tmp_path / "two" / "asset.fbx"
+        source_a.parent.mkdir()
+        source_b.parent.mkdir()
+        source_a.write_bytes(b"placeholder")
+        source_b.write_bytes(b"placeholder")
+
+        with pytest.raises(ValueError, match="duplicate output paths"):
+            export_fbx_auto_uv_batch(
+                [str(source_a), str(source_b)],
+                output_dir=str(tmp_path / "out"),
+                jobs=2,
+            )
+        with pytest.raises(ValueError, match="positive integer"):
+            export_fbx_auto_uv_batch([str(source_a)], jobs=0)
+
+
 class TestFbxSmartUv:
     def test_generated_smart_uv_script_is_valid_python(self, tmp_path):
         fbx_path = tmp_path / "model.fbx"
@@ -1448,6 +1813,7 @@ class TestFbxSmartUv:
         script = generate_fbx_auto_uniform_uv_script(
             str(tmp_path / "source.fbx"), str(tmp_path / "output.fbx"),
             angle_candidates=[0.2, 0.35],
+            smart_uv_options={"rotate_method": "AXIS_ALIGNED_X"},
         )
         compile(script, "<fbx_auto_uniform_uv_script>", "exec")
         assert "bpy.ops.uv.smart_project" in script
@@ -1455,6 +1821,7 @@ class TestFbxSmartUv:
         assert "density_log_std" in script
         assert "FBX_UNIFORM_UV_RESULT" in script
         assert "while len(obj.data.uv_layers) > 0" in script
+        assert "'rotate_method': 'AXIS_ALIGNED_X'" in script
 
     def test_uniform_uv_angles_are_sorted_and_validated(self):
         assert _validate_uniform_uv_angles([0.35, 0.2, 0.35]) == (0.2, 0.35)
@@ -1464,6 +1831,14 @@ class TestFbxSmartUv:
             _validate_uniform_uv_angles([0.0])
         with pytest.raises(ValueError, match="angle candidate"):
             _validate_uniform_uv_angles([4.0])
+
+    def test_uniform_uv_suffix_output_path(self, tmp_path):
+        source = tmp_path / "model.fbx"
+        assert _suffix_output_path(str(source), "_uv") == str(tmp_path / "model_uv.fbx")
+        with pytest.raises(ValueError, match="suffix"):
+            _suffix_output_path(str(source), "")
+        with pytest.raises(ValueError, match="path"):
+            _suffix_output_path(str(source), "nested/_uv")
 
     def test_uniform_uv_rejects_existing_output_without_overwrite(self, tmp_path):
         fbx_path = tmp_path / "model.fbx"

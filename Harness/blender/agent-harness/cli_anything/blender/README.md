@@ -203,7 +203,7 @@ fbx render <input.fbx> <output.png>              - Import FBX into an empty scen
 fbx material-colors <input.fbx> <output.png>     - Render with a distinct color for each mesh material slot
 fbx multi-angle <input.fbx> <output-dir>         - Render several views in one Blender run
 fbx smart-uv-project <input.fbx>                 - Smart UV unwrap all meshes and export an FBX
-fbx auto-uniform-uv <input.fbx>                  - Search UV angles for the most uniform checkerboard result
+fbx auto-uv <input.fbx>...                       - Select a UV algorithm and export one or more validated FBX files
 ```
 
 These FBX commands execute Blender headlessly, set up an automatic camera and
@@ -218,8 +218,18 @@ cli-anything-blender fbx multi-angle .\model.fbx .\output\views --view front --v
 cli-anything-blender fbx smart-uv-project .\model.fbx
 cli-anything-blender fbx smart-uv-project .\model.fbx --output .\output\model_uv.fbx --overwrite
 cli-anything-blender fbx smart-uv-project .\model.fbx --overwrite-source
-cli-anything-blender fbx auto-uniform-uv .\model.fbx --output .\output\model_uniform_uv.fbx --overwrite
-cli-anything-blender fbx auto-uniform-uv .\model.fbx --angle-deg 15 --angle-deg 20 --angle-deg 30
+cli-anything-blender fbx auto-uv .\model.fbx
+cli-anything-blender fbx auto-uv .\model.fbx --algorithm autouv --suffix _autouv --unwrap-exe .\cli_anything\blender\third_party\MinistryOfFlat\UnWrapConsole3.exe
+cli-anything-blender fbx auto-uv .\model.fbx --algorithm autouv --output .\output\model_autouv.fbx --resolution 2048 --udims 2 --separate-hard-edges
+cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform
+cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform --suffix _uv
+cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform --output .\output\model_uniform_uv.fbx --overwrite
+cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform --angle-deg 15 --angle-deg 20 --angle-deg 30
+cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform --rotate-method AXIS_ALIGNED_X
+cli-anything-blender fbx auto-uv .\a.fbx .\b.fbx --algorithm autouv --suffix _autouv
+cli-anything-blender fbx auto-uv .\a.fbx .\b.fbx --algorithm uniform --output-dir .\output --suffix _uv
+cli-anything-blender --json fbx auto-uv .\a.fbx .\b.fbx --algorithm autouv --topology-prefilter-level medium
+cli-anything-blender --json fbx auto-uv .\a.fbx .\b.fbx --algorithm autouv --jobs 2
 ```
 
 `fbx smart-uv-project` writes `model_uv.fbx` beside the source by default. It
@@ -232,15 +242,88 @@ such as `--angle-limit`, `--margin-method`, `--rotate-method`,
 `--island-margin`, `--area-weight`, `--correct-aspect`, and
 `--scale-to-bounds` are available as command options.
 
-`fbx auto-uniform-uv` ignores the source UV coordinates, removes existing UV
+`fbx auto-uv --algorithm uniform` ignores the source UV coordinates, removes existing UV
 layers, and searches Smart UV angle candidates. It selects the result by
 minimizing area-weighted P95 local checker stretch, then maximum stretch, then
 texel-density variation. UV island count, packing efficiency, and texture
 continuity are not part of this objective. Default angle candidates are 10,
 15, 20, 25, 30, 40, 50, 60, and 66 degrees; repeat `--angle-deg` to provide a
-custom candidate set. The command emits every candidate's metrics and the
-selected angle in JSON mode, then performs the same FBX round-trip validation
-as `smart-uv-project`.
+custom candidate set. Use `--rotate-method AXIS_ALIGNED_X` for horizontal island
+alignment, `--rotate-method AXIS_ALIGNED_Y` for vertical alignment, or
+`--rotate-method AXIS_ALIGNED` to let Blender choose the minimal rectangle
+orientation. The command emits every candidate's metrics and the selected
+angle in JSON mode, then performs the same FBX round-trip validation as
+`smart-uv-project`. By default it replaces the input FBX only after the export
+and validation succeed. Use `--suffix _uv` to write a sibling file such as
+`model_uv.fbx`, or `--output <path>` to write to an additional path. Existing
+non-source outputs require `--overwrite`; `--overwrite-source` remains accepted
+as an explicit compatibility flag for the in-place mode.
+
+`fbx auto-uv --algorithm autouv` uses the Ministry of Flat `UnWrapConsole3.exe` bundled inside the
+Harness package at `cli_anything/blender/third_party/MinistryOfFlat/` through a
+temporary OBJ round-trip for each unique mesh datablock. It overwrites the
+active UV Map in place, preserves other UV Maps and scene structure, and then
+performs the same FBX round-trip validation. For standalone installations,
+`--unwrap-exe` or `MINISTRY_OF_FLAT_EXE` can override the bundled executable.
+When `UDIMS=1` and `WORLDSCALE=FALSE`, CLI normalizes each generated UV layer
+proportionally into one `0-1` tile with a small margin; UDIM and world-scale
+outputs retain their original coordinate range.
+The default external settings are resolution 1024, one UDIM, square pixels,
+and all overlap, world-scale, normals, and hard-edge options disabled. Common
+settings can be changed with `--resolution`, `--separate-hard-edges`, `--aspect`,
+`--use-normals`, `--udims`, `--overlap-identical`, `--overlap-mirrored`,
+`--world-scale`, and `--density`.
+
+AutoUV performs a versioned topology-risk preflight (currently `risk_version: 2`)
+by default after importing the FBX and before exporting temporary OBJ files or
+starting `UnWrapConsole3.exe`. The fixed score checks mesh size, boundary edge
+ratio/count, n-gon density, large faces, duplicate positions, zero-area faces,
+interior non-manifold edges, and the boundary-plus-n-gon combinations that are
+known to trigger slow paths. Each metric uses only its highest scoring band.
+The result includes the measured values and `triggered_rules`; a high-risk FBX
+is reported as `skipped`, produces no output, and does not start the external tool.
+The filter level is selected with `--topology-prefilter-level`:
+`high` is the standard default and skips only high-risk files, `medium` is a
+strict mode that skips medium- and high-risk files, and `off` keeps the
+diagnostic but never blocks on topology risk. The legacy
+`--topology-prefilter` and `--no-topology-prefilter` flags remain accepted as
+aliases for `high` and `off`; do not combine them with the new level option.
+Uniform UV never uses this preflight.
+
+For batch jobs, progress is reported once per file. In `--json` mode progress
+events are JSON Lines on stderr, while the final aggregate JSON remains the only
+document written to stdout. Processing continues after individual failures or
+topology skips; the final exit code is non-zero if either occurred, and the
+summary contains `success_count`, `failure_count`, and `skipped_count`.
+
+AutoUV always sends the original imported mesh topology to Ministry of Flat.
+The Harness does not triangulate or clean a derived temporary mesh; it validates
+the returned OBJ topology and copies its UVs directly to the active UV map.
+Each AutoUV input FBX has a hard 10-second processing
+budget covering Blender import, temporary mesh work, the external call, FBX
+export, and round-trip validation. If the budget is exceeded, that FBX is
+skipped without committing an output and the batch continues. The external
+process is launched with a controllable `Popen` lifetime; on timeout the Windows
+process tree is terminated with `taskkill /T /F` (or the Unix process group is
+terminated), and the result records whether cleanup succeeded.
+
+Batch processing uses up to two independent Blender/Ministry of Flat workers by
+default. Use `--jobs 1` for serial processing or increase `--jobs` when the
+machine has sufficient CPU and memory. Files are scheduled independently, the
+final JSON results remain in input order, and progress events include the
+completed-file count. A failed or timed-out worker releases its slot so later
+files continue processing.
+
+Both algorithms support multiple FBX inputs in one invocation. Without an
+output option each source is replaced after successful validation. Use
+`--suffix` for sibling outputs or `--output-dir` for a shared output folder;
+`--output` remains limited to a single input. Batch processing continues after
+individual failures and returns a per-file JSON result with a non-zero exit
+code when any file fails. Progress is reported once per file: in `--json` mode,
+single-line progress JSON events are written to stderr while the final batch
+summary remains valid JSON on stdout. Without `--json`, stderr shows human-readable
+`[index/total]` messages. A failed file includes its error text in both the
+progress event and the final per-file result.
 
 Supported output extensions are `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`,
 `.tiff`, and `.exr`. Use `--engine CYCLES`, `--resolution-x`,

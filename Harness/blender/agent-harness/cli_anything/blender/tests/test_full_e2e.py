@@ -22,7 +22,12 @@ from cli_anything.blender.core.modifiers import add_modifier, list_modifiers
 from cli_anything.blender.core.lighting import add_camera, add_light, set_camera, set_light, list_cameras, list_lights
 from cli_anything.blender.core.animation import add_keyframe, set_frame_range, set_fps, list_keyframes
 from cli_anything.blender.core.render import set_render_settings, render_scene, generate_bpy_script, get_render_settings
-from cli_anything.blender.core.fbx import export_fbx_smart_uv, export_fbx_auto_uniform_uv
+from cli_anything.blender.core.fbx import (
+    export_fbx_smart_uv,
+    export_fbx_auto_uniform_uv,
+    export_fbx_auto_uv,
+    resolve_ministry_of_flat_executable,
+)
 from cli_anything.blender.core import preview as preview_mod
 from cli_anything.blender.core.session import Session
 from cli_anything.blender.utils.bpy_gen import generate_full_script
@@ -1296,6 +1301,29 @@ print('Render complete')
 
 @pytest.mark.skipif(not _blender_available(), reason="Blender executable is not configured")
 class TestFbxSmartUvE2E:
+    def test_cli_auto_uv_preserves_fbx_roundtrip(self, tmp_dir):
+        source = os.path.join(tmp_dir, "autouv_source.fbx")
+        output_path = os.path.join(tmp_dir, "autouv_output.fbx")
+        _create_smart_uv_fixture(source)
+
+        result = export_fbx_auto_uv(
+            source,
+            output_path,
+            executable_path=resolve_ministry_of_flat_executable(),
+            resolution=1024,
+            timeout=240,
+            external_timeout=120,
+        )
+
+        assert result["output_fbx"] == os.path.abspath(output_path)
+        assert os.path.isfile(output_path)
+        assert result["mesh_objects"] == 2
+        assert result["unique_mesh_datablocks"] == 2
+        assert result["processed_mesh_objects"] == 2
+        assert result["normalized_meshes"] == 2
+        assert result["uv_loop_count"] > 0
+        assert result["validation"]["errors"] == []
+
     def test_cli_smart_uv_preserves_roundtrip_semantics(self, tmp_dir):
         source = os.path.join(tmp_dir, "hierarchy.fbx")
         _create_smart_uv_fixture(source)
@@ -1342,8 +1370,9 @@ class TestFbxSmartUvE2E:
         output_path = os.path.join(tmp_dir, "uniform_output.fbx")
         _create_smart_uv_fixture(source)
 
-        result = export_fbx_auto_uniform_uv(
+        result = export_fbx_auto_uv(
             source, output_path, angle_candidates=[0.2, 0.35], timeout=240,
+            algorithm="uniform",
         )
         assert result["output_fbx"] == os.path.abspath(output_path)
         assert os.path.isfile(output_path)
@@ -1352,4 +1381,16 @@ class TestFbxSmartUvE2E:
         assert len(result["candidates"]) == 2
         assert result["selected_metrics"]["stretch_p95"] >= 1.0
         assert result["selected_metrics"]["density_log_std"] >= 0.0
+        assert result["validation"]["errors"] == []
+
+    def test_auto_uniform_uv_defaults_to_overwriting_source(self, tmp_dir):
+        source = os.path.join(tmp_dir, "uniform_in_place.fbx")
+        _create_smart_uv_fixture(source)
+
+        result = export_fbx_auto_uniform_uv(
+            source, angle_candidates=[0.2, 0.35], timeout=240,
+        )
+
+        assert result["output_fbx"] == os.path.abspath(source)
+        assert os.path.isfile(source)
         assert result["validation"]["errors"] == []

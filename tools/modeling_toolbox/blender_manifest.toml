@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "modeling_toolbox"
+version = "1.4.0"
+name = "建模工具箱"
+tagline = "常用建模整理工具，包括材质整理、变换应用、原点调整和 AutoUV"
+maintainer = "Codex"
+type = "add-on"
+
+tags = ["3D View", "Modeling", "UV Mapping", "User Interface"]
+
+blender_version_min = "5.1.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    "/.git/",
+    "/*.zip",
+]

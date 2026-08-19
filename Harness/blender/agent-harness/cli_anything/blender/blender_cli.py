@@ -66,6 +66,92 @@ def output(data, message: str = ""):
             click.echo(str(data))
 
 
+def _emit_auto_uv_progress(event: dict) -> None:
+    """Write file-level AutoUV progress without contaminating final JSON stdout."""
+
+    if _json_output:
+        click.echo(json.dumps(event, ensure_ascii=False, separators=(",", ":")), err=True)
+        return
+
+    event_name = event.get("event")
+    if event_name == "batch_started":
+        click.echo(
+            f"AutoUV batch started: {event.get('total', 0)} file(s), "
+            f"parallel jobs={event.get('effective_jobs', event.get('jobs', 1))}",
+            err=True,
+        )
+    elif event_name == "file_started":
+        click.echo(
+            f"[{event.get('index', 0)}/{event.get('total', 0)}] "
+            f"Processing: {event.get('input_fbx', '')}",
+            err=True,
+        )
+    elif event_name == "file_finished":
+        if event.get("skipped"):
+            skip_reason = event.get("skip_reason")
+            if skip_reason == "processing_timeout":
+                detail = event.get("error") or (
+                    f"processing exceeded {event.get('timeout_seconds', 10)} seconds"
+                )
+                cleanup = event.get("process_cleanup")
+                if cleanup and "process cleanup" not in detail.lower():
+                    detail += (
+                        "; process cleanup "
+                        f"{'succeeded' if cleanup.get('ok') else 'failed'}"
+                    )
+            elif skip_reason == "topology_risk" or event.get("preflight"):
+                preflight = event.get("preflight") or {}
+                reasons = ", ".join(preflight.get("reasons") or [])
+                highest_mesh = next(
+                    (
+                        mesh for mesh in preflight.get("meshes", [])
+                        if mesh.get("object") == preflight.get("highest_risk_mesh")
+                    ),
+                    {},
+                )
+                metrics = (
+                    f"; boundary ratio {float(highest_mesh.get('boundary_edge_ratio', 0.0)):.1%}"
+                    f", n-gon ratio {float(highest_mesh.get('ngon_ratio', 0.0)):.1%}"
+                    f", max face vertices {highest_mesh.get('max_polygon_vertices', '?')}"
+                    if highest_mesh else ""
+                )
+                detail = (
+                    f"topology risk {preflight.get('risk_score', event.get('risk_score', '?'))} "
+                    f"({preflight.get('risk_level', 'high')})"
+                    + metrics
+                    + (f"; triggered: {reasons}" if reasons else "")
+                )
+            else:
+                detail = event.get("error") or skip_reason or "skipped"
+            click.echo(
+                f"[{event.get('completed_count', event.get('index', 0))}/{event.get('total', 0)}] Skipped: "
+                f"{event.get('input_fbx', '')} - {detail}",
+                err=True,
+            )
+        elif event.get("ok"):
+            warnings = event.get("warnings") or []
+            detail = f"; warning: {' | '.join(warnings)}" if warnings else ""
+            click.echo(
+                f"[{event.get('completed_count', event.get('index', 0))}/{event.get('total', 0)}] "
+                f"Completed: {event.get('input_fbx', '')}{detail}",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"[{event.get('completed_count', event.get('index', 0))}/{event.get('total', 0)}] "
+                f"Failed: {event.get('input_fbx', '')} - {event.get('error', '')}",
+                err=True,
+            )
+    elif event_name == "batch_finished":
+        click.echo(
+            f"AutoUV batch finished: {event.get('success_count', 0)}/"
+            f"{event.get('total', 0)} succeeded, "
+            f"{event.get('skipped_count', 0)} skipped, "
+            f"parallel jobs={event.get('effective_jobs', event.get('jobs', 1))}",
+            err=True,
+        )
+
+
 def _spawn_live_viewer(session_dir: str, poll_ms: int) -> dict:
     """Launch cli-hub live preview watcher when available."""
     hub = shutil.which("cli-hub")
@@ -164,6 +250,12 @@ def handle_error(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
+        except click.exceptions.Exit:
+            # A command may use Click's Exit exception to report a non-zero
+            # result after it has already emitted its structured payload.
+            # Do not let the generic RuntimeError handler turn Exit(1) into
+            # a second, meaningless JSON error such as {"error": "1"}.
+            raise
         except FileNotFoundError as e:
             if _json_output:
                 click.echo(json.dumps({"error": str(e), "type": "file_not_found"}))
@@ -990,8 +1082,8 @@ def fbx_multi_angle(fbx_path, output_dir, views, image_format, material_colors, 
               help="Scale packed UVs to the 0-1 bounds.")
 @handle_error
 def fbx_smart_uv_project(fbx_path, output_path, overwrite, overwrite_source, timeout,
-                         angle_limit, margin_method, rotate_method, island_margin,
-                         area_weight, correct_aspect, scale_to_bounds):
+                          angle_limit, margin_method, rotate_method, island_margin,
+                          area_weight, correct_aspect, scale_to_bounds):
     """Smart-unwrap all meshes in FBX_PATH and export a validated FBX."""
     result = fbx_mod.export_fbx_smart_uv(
         fbx_path, output_path,
@@ -1009,31 +1101,94 @@ def fbx_smart_uv_project(fbx_path, output_path, overwrite, overwrite_source, tim
     output(result, f"Smart UV Project FBX exported: {result['output_fbx']}")
 
 
-@fbx_group.command("auto-uniform-uv")
-@click.argument("fbx_path", type=click.Path(exists=True, dir_okay=False))
+@fbx_group.command("auto-uv")
+@click.argument("fbx_paths", nargs=-1, type=click.Path(exists=True, dir_okay=False))
+@click.option("--algorithm", type=click.Choice(fbx_mod.AUTO_UV_ALGORITHMS), default="autouv",
+              show_default=True, help="UV algorithm: autouv (Ministry of Flat) or uniform (Blender).")
 @click.option("--output", "output_path", type=click.Path(dir_okay=False), default=None,
-              help="Explicit output FBX path; defaults to INPUT with a _uniform_uv suffix.")
+              help="Write to an additional FBX path instead of replacing INPUT.fbx.")
+@click.option("--output-dir", type=click.Path(file_okay=False), default=None,
+              help="Write batch outputs to this directory, preserving each input filename.")
+@click.option("--suffix", type=str, default=None,
+              help="Write beside INPUT.fbx with this filename suffix, e.g. _autouv.")
 @click.option("--overwrite", is_flag=True,
-              help="Allow replacing an existing explicit or default output file.")
+              help="Allow replacing an existing suffix or explicit output file.")
 @click.option("--overwrite-source", is_flag=True,
-              help="Replace INPUT.fbx after validation; cannot be combined with --output.")
-@click.option("--timeout", type=int, default=300, show_default=True,
-              help="Blender timeout in seconds.")
+              help="Explicitly request replacing INPUT.fbx; cannot be combined with output options.")
+@click.option("--timeout", type=int, default=10, show_default=True,
+              help="Per-file Blender timeout; AutoUV processing is hard-capped at 10 seconds.")
+@click.option("--external-timeout", type=int, default=10, show_default=True,
+              help="Per-mesh external timeout; each FBX is hard-capped at 10 seconds.")
+@click.option("--jobs", type=int, default=2, show_default=True,
+              help="Maximum number of FBX files processed concurrently; use 1 for serial mode.")
+@click.option("--topology-prefilter/--no-topology-prefilter", default=None,
+              help="Legacy alias: enable standard high-risk filtering or disable filtering.")
+@click.option("--topology-prefilter-level", type=click.Choice(fbx_mod.TOPOLOGY_PREFILTER_LEVELS),
+              default=None, help="Topology filtering level: off, high, or medium.")
+@click.option("--unwrap-exe", "unwrap_exe", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Path to UnWrapConsole3.exe; otherwise auto-detect or use MINISTRY_OF_FLAT_EXE.")
+@click.option("--resolution", type=int, default=None, help="Texture resolution passed to Ministry of Flat.")
+@click.option("--separate-hard-edges/--no-separate-hard-edges", default=None,
+              help="Guarantee separation along hard edges.")
+@click.option("--aspect", type=float, default=None, help="Texture pixel aspect ratio.")
+@click.option("--use-normals/--no-use-normals", default=None,
+              help="Use source mesh normals when classifying polygons.")
+@click.option("--udims", type=int, default=None, help="Number of UDIM tiles.")
+@click.option("--overlap-identical/--no-overlap-identical", default=None,
+              help="Overlap identical parts.")
+@click.option("--overlap-mirrored/--no-overlap-mirrored", default=None,
+              help="Overlap mirrored parts.")
+@click.option("--world-scale/--no-world-scale", default=None,
+              help="Scale UV space to world scale.")
+@click.option("--density", type=int, default=None, help="Pixels per world unit when world scale is enabled.")
 @click.option("--angle-deg", "angle_degrees", multiple=True, type=float,
-              help="Candidate Smart UV angle in degrees; repeat to override defaults.")
+              help="Uniform UV candidate angle in degrees; repeat to override defaults.")
+@click.option("--rotate-method", type=click.Choice(fbx_mod.SMART_UV_ROTATE_METHODS), default=None,
+              help="Uniform UV island rotation method.")
 @handle_error
-def fbx_auto_uniform_uv(fbx_path, output_path, overwrite, overwrite_source, timeout,
-                         angle_degrees):
-    """Search Smart UV angles and export the result with the most uniform checkerboard."""
+def fbx_auto_uv(fbx_paths, algorithm, output_path, output_dir, suffix, overwrite, overwrite_source, timeout,
+                external_timeout, jobs, topology_prefilter, topology_prefilter_level, unwrap_exe,
+                resolution, separate_hard_edges, aspect,
+                use_normals, udims, overlap_identical, overlap_mirrored, world_scale, density,
+                angle_degrees, rotate_method):
+    """Run one selected UV algorithm for one or more FBX files."""
     angle_candidates = [math.radians(value) for value in angle_degrees] if angle_degrees else None
-    result = fbx_mod.export_fbx_auto_uniform_uv(
-        fbx_path, output_path,
+    result = fbx_mod.export_fbx_auto_uv_batch(
+        fbx_paths,
+        algorithm=algorithm,
+        output_dir=output_dir,
+        output_path=output_path,
         overwrite=overwrite,
         overwrite_source=overwrite_source,
+        suffix=suffix,
         timeout=timeout,
+        external_timeout=external_timeout,
+        jobs=jobs,
+        topology_prefilter=topology_prefilter if algorithm == "autouv" else None,
+        topology_prefilter_level=(
+            topology_prefilter_level if algorithm == "autouv" else None
+        ),
+        executable_path=unwrap_exe,
+        resolution=resolution,
+        separate_hard_edges=separate_hard_edges,
+        aspect=aspect,
+        use_normals=use_normals,
+        udims=udims,
+        overlap_identical=overlap_identical,
+        overlap_mirrored=overlap_mirrored,
+        world_scale=world_scale,
+        density=density,
         angle_candidates=angle_candidates,
+        rotate_method=rotate_method,
+        progress_callback=_emit_auto_uv_progress,
     )
-    output(result, f"Auto uniform UV FBX exported: {result['output_fbx']}")
+    output(
+        result,
+        f"AutoUV batch complete: {result['success_count']}/{result['total']} succeeded, "
+        f"{result.get('skipped_count', 0)} skipped",
+    )
+    if result.get("failure_count", 0) or result.get("skipped_count", 0):
+        raise click.exceptions.Exit(1)
 
 
 @cli.group("preview")
@@ -1247,7 +1402,7 @@ def repl(project_path):
         "light":     "add|set|list",
         "animation": "keyframe|remove-keyframe|frame-range|fps|list-keyframes",
         "render":    "settings|info|presets|execute|script",
-        "fbx":       "render|material-colors|multi-angle|smart-uv-project|auto-uniform-uv",
+        "fbx":       "render|material-colors|multi-angle|smart-uv-project|auto-uv",
         "preview":   "recipes|capture|latest|live start|push|status|stop",
         "session":   "status|undo|redo|history",
         "help":      "show this help",

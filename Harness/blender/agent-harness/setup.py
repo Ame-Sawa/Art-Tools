@@ -48,6 +48,9 @@ setup(
     ],
 
     extras_require={
+        "gui": [
+            "PySide6>=6.6",
+        ],
         "dev": [
             "pytest>=7",
             "pytest-cov>=4",
@@ -56,11 +59,16 @@ setup(
 
     entry_points={
         "console_scripts": [
-            "cli-anything-blender=cli_anything.blender.blender_cli:main",
-        ],
+        "cli-anything-blender=cli_anything.blender.blender_cli:main",
+        "cli-anything-blender-gui=cli_anything.blender_gui.app:main",
+    ],
     },
     package_data={
-        "cli_anything.blender": ["skills/*.md"],
+        "cli_anything.blender": [
+            "skills/*.md",
+            "third_party/MinistryOfFlat/*.exe",
+            "third_party/MinistryOfFlat/*.txt",
+        ],
     },
     include_package_data=True,
     zip_safe=False,

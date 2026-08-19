@@ -1,0 +1,11 @@
+建模工具箱第三方组件声明
+========================
+
+组件：Ministry of Flat / UnWrapConsole3.exe
+版本：随附文件的发行版本（documentation.txt 中标记为 3.7.2）
+来源：用户提供的 H:\HDownload\AutoUV\AutoUV\MinistryOfFlat_Release
+用途：为 Blender 选中的网格对象生成 AutoUV UV 坐标。
+
+该可执行文件由原作者提供，并依据用户确认的授权随本工具箱使用。
+本工具箱仅通过命令行调用 UnWrapConsole3.exe，不包含 UnWrap3.exe GUI 版本。
+如需重新分发或公开发布，请同时遵守原作者的许可与授权要求。
