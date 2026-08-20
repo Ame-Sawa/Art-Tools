@@ -107,6 +107,40 @@ def test_batch_autouv_supports_strict_topology_prefilter(tmp_path: Path):
     assert args[args.index("--topology-prefilter-level") + 1] == "medium"
 
 
+def test_batch_request_can_add_internal_cancel_file(tmp_path: Path):
+    source = make_source(tmp_path, "asset.fbx")
+    request = validate_batch_request(
+        [str(source)], "autouv", "source", "", None, 10, 10, None,
+    )
+    args = build_batch_uv_args(request, cancel_file=str(tmp_path / "cancel.marker"))
+    assert args[args.index("--cancel-file") + 1] == str(tmp_path / "cancel.marker")
+
+
+def test_batch_autouv_defaults_to_merge_and_normalize(tmp_path: Path):
+    source = make_source(tmp_path, "pipeline.fbx")
+    request = validate_batch_request(
+        [str(source)], "autouv", "source", "", None, 300, 120, None,
+    )
+    assert request.merge_meshes is True
+    assert request.normalize_uv is True
+    args = build_batch_uv_args(request)
+    assert "--merge-meshes" in args
+    assert "--normalize-uv" in args
+
+
+def test_batch_autouv_can_disable_merge_and_normalize(tmp_path: Path):
+    source = make_source(tmp_path, "pipeline.fbx")
+    request = validate_batch_request(
+        [str(source)], "autouv", "source", "", None, 913, 47, None,
+        merge_meshes=False, normalize_uv=False,
+    )
+    args = build_batch_uv_args(request)
+    assert "--no-merge-meshes" in args
+    assert "--no-normalize-uv" in args
+    assert args[args.index("--timeout") + 1] == "913"
+    assert args[args.index("--external-timeout") + 1] == "47"
+
+
 def test_batch_topology_prefilter_level_conflicts_with_legacy_bool(tmp_path: Path):
     source = make_source(tmp_path, "asset.fbx")
     with pytest.raises(ValueError, match="同时使用"):

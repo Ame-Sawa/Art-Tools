@@ -35,6 +35,11 @@ def test_main_window_is_batch_only_and_starts_empty(qapp, monkeypatch):
     assert not window.output_dir_edit.isEnabled()
     assert window.topology_prefilter_combo.currentData() == "high"
     assert window.parallel_jobs_spin.value() == 2
+    assert window.timeout_spin.value() == 300
+    assert window.external_timeout_spin.value() == 120
+    assert window.merge_meshes_check.isChecked()
+    assert window.normalize_uv_check.isChecked()
+    assert "跨 Mesh 合并展开并归一化 UV" in window.autouv_status_label.text()
     assert window.activity_table.columnCount() == 5
     assert "#000000" in window.activity_table.styleSheet()
 
@@ -114,6 +119,22 @@ def test_gui_migrates_topology_prefilter_settings(qapp, monkeypatch, saved, expe
     assert window.topology_prefilter_combo.currentData() == expected
 
 
+def test_gui_migrates_legacy_global_pack_and_updates_autouv_status(qapp, monkeypatch):
+    monkeypatch.setattr(
+        app_module, "load_settings",
+        lambda: {"global_pack": False, "normalize_uv": True},
+    )
+    window = app_module.UniformUVWindow()
+    assert not window.merge_meshes_check.isChecked()
+    assert "逐 Mesh 展开并归一化 UV" in window.autouv_status_label.text()
+
+    window.udims_spin.setValue(2)
+    assert "UDIM>1" in window.autouv_status_label.text()
+    window.udims_spin.setValue(1)
+    window.world_scale_check.setChecked(True)
+    assert "绝对纹素密度可能改变" in window.autouv_status_label.text()
+
+
 def test_gui_progress_events_update_file_count_and_status(qapp):
     window = app_module.UniformUVWindow()
 
@@ -186,6 +207,25 @@ def test_gui_progress_events_display_topology_skip(qapp):
     })
     assert "跳过：1" in formatted
     assert "[跳过]" in formatted
+
+
+def test_gui_progress_events_display_cancelled_file(qapp):
+    window = app_module.UniformUVWindow()
+    window._handle_progress_event({"event": "batch_started", "total": 1})
+    window._handle_progress_event({
+        "event": "file_finished",
+        "index": 1,
+        "total": 1,
+        "completed_count": 1,
+        "input_fbx": r"H:\models\cancelled.fbx",
+        "ok": False,
+        "cancelled": True,
+        "skip_reason": "cancelled",
+        "error": "Batch cancelled before this file started.",
+    })
+
+    assert window.activity_table.item(0, 1).text() == "已取消"
+    assert "cancelled" in window.activity_table.item(0, 4).text()
 
 
 def test_gui_parallel_progress_uses_completed_count_not_input_index(qapp):

@@ -29,6 +29,8 @@ AUTO_UV_DEFAULTS = {
     "overlap_mirrored": False,
     "world_scale": False,
     "density": 1024,
+    "merge_meshes": True,
+    "normalize_uv": True,
 }
 AUTO_UV_ALGORITHMS = ("autouv", "uniform")
 TOPOLOGY_PREFILTER_LEVELS = ("off", "high", "medium")
@@ -69,6 +71,8 @@ class BatchUVRequest:
     overlap_mirrored: bool
     world_scale: bool
     density: int
+    merge_meshes: bool
+    normalize_uv: bool
     angle_degrees: tuple[float, ...]
     rotate_method: Optional[str]
 
@@ -184,6 +188,8 @@ def validate_batch_request(
     overlap_mirrored: bool = AUTO_UV_DEFAULTS["overlap_mirrored"],
     world_scale: bool = AUTO_UV_DEFAULTS["world_scale"],
     density: int = AUTO_UV_DEFAULTS["density"],
+    merge_meshes: bool = AUTO_UV_DEFAULTS["merge_meshes"],
+    normalize_uv: bool = AUTO_UV_DEFAULTS["normalize_uv"],
     angle_degrees: Sequence[float] = (),
     rotate_method: Optional[str] = None,
     overwrite: bool = False,
@@ -271,6 +277,8 @@ def validate_batch_request(
         bool(overlap_mirrored),
         bool(world_scale),
         density_value,
+        bool(merge_meshes),
+        bool(normalize_uv),
         angles,
         rotate_method,
     )
@@ -292,7 +300,11 @@ def batch_output_paths(request: BatchUVRequest) -> tuple[str, ...]:
     return tuple(outputs)
 
 
-def build_batch_uv_args(request: BatchUVRequest) -> list[str]:
+def build_batch_uv_args(
+    request: BatchUVRequest,
+    *,
+    cancel_file: Optional[str] = None,
+) -> list[str]:
     """Build the unified multi-file AutoUV CLI invocation."""
 
     args = ["--json", "fbx", "auto-uv", *request.source_paths, "--algorithm", request.algorithm]
@@ -311,6 +323,8 @@ def build_batch_uv_args(request: BatchUVRequest) -> list[str]:
             "--jobs", str(request.jobs),
         )
     )
+    if cancel_file:
+        args.extend(("--cancel-file", os.path.abspath(cancel_file)))
     if request.algorithm == "autouv":
         args.extend(("--topology-prefilter-level", request.topology_prefilter_level))
         if request.unwrap_exe:
@@ -326,6 +340,8 @@ def build_batch_uv_args(request: BatchUVRequest) -> list[str]:
                 "--overlap-identical" if request.overlap_identical else "--no-overlap-identical",
                 "--overlap-mirrored" if request.overlap_mirrored else "--no-overlap-mirrored",
                 "--world-scale" if request.world_scale else "--no-world-scale",
+                "--merge-meshes" if request.merge_meshes else "--no-merge-meshes",
+                "--normalize-uv" if request.normalize_uv else "--no-normalize-uv",
             )
         )
     else:

@@ -189,6 +189,35 @@ def test_cli_passes_topology_prefilter_level(monkeypatch, tmp_path):
     assert observed["topology_prefilter"] is None
 
 
+def test_cli_passes_autouv_pipeline_switches_and_configurable_timeouts(monkeypatch, tmp_path):
+    source = make_fbx(tmp_path, "pipeline.fbx")
+    observed = {}
+
+    def fake_batch(paths, *, progress_callback=None, **kwargs):
+        observed.update(kwargs)
+        return {
+            "algorithm": "autouv", "total": 1, "success_count": 1,
+            "failure_count": 0, "skipped_count": 0,
+            "results": [{"input_fbx": str(paths[0]), "output_fbx": str(paths[0]), "ok": True}],
+        }
+
+    monkeypatch.setattr(blender_cli.fbx_mod, "export_fbx_auto_uv_batch", fake_batch)
+    result = CliRunner().invoke(
+        blender_cli.cli,
+        [
+            "--json", "fbx", "auto-uv", str(source),
+            "--no-merge-meshes", "--no-normalize-uv",
+            "--timeout", "913", "--external-timeout", "47",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert observed["merge_meshes"] is False
+    assert observed["normalize_uv"] is False
+    assert observed["timeout"] == 913
+    assert observed["external_timeout"] == 47
+
+
 def test_cli_passes_parallel_jobs(monkeypatch, tmp_path):
     source_a = make_fbx(tmp_path, "a.fbx")
     source_b = make_fbx(tmp_path, "b.fbx")
@@ -213,6 +242,38 @@ def test_cli_passes_parallel_jobs(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert observed["jobs"] == 4
+
+
+def test_cli_cancel_file_returns_cancelled_summary_and_exit_130(monkeypatch, tmp_path):
+    source = make_fbx(tmp_path, "cancelled.fbx")
+    cancel_file = tmp_path / "cancel.marker"
+    cancel_file.write_text("cancel\n", encoding="utf-8")
+
+    def fake_batch(paths, *, progress_callback=None, cancellation_context=None, **kwargs):
+        assert cancellation_context.is_cancelled()
+        return {
+            "algorithm": "autouv", "total": 1, "success_count": 0,
+            "failure_count": 0, "skipped_count": 0,
+            "cancelled": True, "cancelled_count": 1,
+            "results": [{
+                "input_fbx": str(paths[0]), "ok": False,
+                "cancelled": True, "skip_reason": "cancelled",
+            }],
+        }
+
+    monkeypatch.setattr(blender_cli.fbx_mod, "export_fbx_auto_uv_batch", fake_batch)
+    result = CliRunner().invoke(
+        blender_cli.cli,
+        [
+            "--json", "fbx", "auto-uv", str(source),
+            "--cancel-file", str(cancel_file),
+        ],
+    )
+
+    assert result.exit_code == 130, result.output
+    summary = json.loads(result.stdout)
+    assert summary["cancelled"] is True
+    assert summary["cancelled_count"] == 1
 
 
 def test_cli_rejects_legacy_and_level_prefilter_options_together(tmp_path):

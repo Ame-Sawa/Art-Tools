@@ -19,6 +19,7 @@ import os
 import json
 import math
 import shlex
+import signal
 import shutil
 import subprocess
 import click
@@ -80,6 +81,8 @@ def _emit_auto_uv_progress(event: dict) -> None:
             f"parallel jobs={event.get('effective_jobs', event.get('jobs', 1))}",
             err=True,
         )
+    elif event_name == "batch_cancel_requested":
+        click.echo("AutoUV batch cancellation requested; cleaning active workers", err=True)
     elif event_name == "file_started":
         click.echo(
             f"[{event.get('index', 0)}/{event.get('total', 0)}] "
@@ -87,11 +90,18 @@ def _emit_auto_uv_progress(event: dict) -> None:
             err=True,
         )
     elif event_name == "file_finished":
-        if event.get("skipped"):
+        if event.get("cancelled"):
+            click.echo(
+                f"[{event.get('completed_count', event.get('index', 0))}/{event.get('total', 0)}] "
+                f"Cancelled: {event.get('input_fbx', '')} - "
+                f"{event.get('error', 'batch cancelled')}",
+                err=True,
+            )
+        elif event.get("skipped"):
             skip_reason = event.get("skip_reason")
             if skip_reason == "processing_timeout":
                 detail = event.get("error") or (
-                    f"processing exceeded {event.get('timeout_seconds', 10)} seconds"
+                    f"processing exceeded {event.get('timeout_seconds', 300)} seconds"
                 )
                 cleanup = event.get("process_cleanup")
                 if cleanup and "process cleanup" not in detail.lower():
@@ -147,6 +157,7 @@ def _emit_auto_uv_progress(event: dict) -> None:
             f"AutoUV batch finished: {event.get('success_count', 0)}/"
             f"{event.get('total', 0)} succeeded, "
             f"{event.get('skipped_count', 0)} skipped, "
+            f"{event.get('cancelled_count', 0)} cancelled, "
             f"parallel jobs={event.get('effective_jobs', event.get('jobs', 1))}",
             err=True,
         )
@@ -1115,12 +1126,14 @@ def fbx_smart_uv_project(fbx_path, output_path, overwrite, overwrite_source, tim
               help="Allow replacing an existing suffix or explicit output file.")
 @click.option("--overwrite-source", is_flag=True,
               help="Explicitly request replacing INPUT.fbx; cannot be combined with output options.")
-@click.option("--timeout", type=int, default=10, show_default=True,
-              help="Per-file Blender timeout; AutoUV processing is hard-capped at 10 seconds.")
-@click.option("--external-timeout", type=int, default=10, show_default=True,
-              help="Per-mesh external timeout; each FBX is hard-capped at 10 seconds.")
+@click.option("--timeout", type=int, default=300, show_default=True,
+              help="Per-file Blender total timeout in seconds; configurable without a hard cap.")
+@click.option("--external-timeout", type=int, default=120, show_default=True,
+              help="Per-mesh or combined external AutoUV timeout in seconds.")
 @click.option("--jobs", type=int, default=2, show_default=True,
               help="Maximum number of FBX files processed concurrently; use 1 for serial mode.")
+@click.option("--cancel-file", type=click.Path(dir_okay=False), default=None,
+              hidden=True, help="Internal cooperative cancellation marker used by the GUI.")
 @click.option("--topology-prefilter/--no-topology-prefilter", default=None,
               help="Legacy alias: enable standard high-risk filtering or disable filtering.")
 @click.option("--topology-prefilter-level", type=click.Choice(fbx_mod.TOPOLOGY_PREFILTER_LEVELS),
@@ -1141,54 +1154,89 @@ def fbx_smart_uv_project(fbx_path, output_path, overwrite, overwrite_source, tim
 @click.option("--world-scale/--no-world-scale", default=None,
               help="Scale UV space to world scale.")
 @click.option("--density", type=int, default=None, help="Pixels per world unit when world scale is enabled.")
+@click.option("--merge-meshes/--no-merge-meshes", default=None,
+              help="For UDIM=1, merge unique Mesh datablocks into one OBJ and call AutoUV once (default: enabled).")
+@click.option("--normalize-uv/--no-normalize-uv", default=None,
+              help="For UDIM=1, normalize generated UVs into one 0-1 tile (default: enabled).")
 @click.option("--angle-deg", "angle_degrees", multiple=True, type=float,
               help="Uniform UV candidate angle in degrees; repeat to override defaults.")
 @click.option("--rotate-method", type=click.Choice(fbx_mod.SMART_UV_ROTATE_METHODS), default=None,
               help="Uniform UV island rotation method.")
 @handle_error
 def fbx_auto_uv(fbx_paths, algorithm, output_path, output_dir, suffix, overwrite, overwrite_source, timeout,
-                external_timeout, jobs, topology_prefilter, topology_prefilter_level, unwrap_exe,
+                external_timeout, jobs, cancel_file, topology_prefilter, topology_prefilter_level, unwrap_exe,
                 resolution, separate_hard_edges, aspect,
                 use_normals, udims, overlap_identical, overlap_mirrored, world_scale, density,
+                merge_meshes, normalize_uv,
                 angle_degrees, rotate_method):
     """Run one selected UV algorithm for one or more FBX files."""
+    from cli_anything.blender.utils.blender_backend import create_cancellation_context
+
     angle_candidates = [math.radians(value) for value in angle_degrees] if angle_degrees else None
-    result = fbx_mod.export_fbx_auto_uv_batch(
-        fbx_paths,
-        algorithm=algorithm,
-        output_dir=output_dir,
-        output_path=output_path,
-        overwrite=overwrite,
-        overwrite_source=overwrite_source,
-        suffix=suffix,
-        timeout=timeout,
-        external_timeout=external_timeout,
-        jobs=jobs,
-        topology_prefilter=topology_prefilter if algorithm == "autouv" else None,
-        topology_prefilter_level=(
-            topology_prefilter_level if algorithm == "autouv" else None
-        ),
-        executable_path=unwrap_exe,
-        resolution=resolution,
-        separate_hard_edges=separate_hard_edges,
-        aspect=aspect,
-        use_normals=use_normals,
-        udims=udims,
-        overlap_identical=overlap_identical,
-        overlap_mirrored=overlap_mirrored,
-        world_scale=world_scale,
-        density=density,
-        angle_candidates=angle_candidates,
-        rotate_method=rotate_method,
-        progress_callback=_emit_auto_uv_progress,
-    )
-    output(
-        result,
-        f"AutoUV batch complete: {result['success_count']}/{result['total']} succeeded, "
-        f"{result.get('skipped_count', 0)} skipped",
-    )
-    if result.get("failure_count", 0) or result.get("skipped_count", 0):
-        raise click.exceptions.Exit(1)
+    cancellation = create_cancellation_context(cancel_file)
+    previous_handlers = {}
+
+    def request_cancel(signum, _frame):
+        cancellation.request_cancel(f"signal-{signum}")
+
+    for signum in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if signum is None:
+            continue
+        try:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_cancel)
+        except (OSError, ValueError):
+            continue
+    try:
+        result = fbx_mod.export_fbx_auto_uv_batch(
+            fbx_paths,
+            algorithm=algorithm,
+            output_dir=output_dir,
+            output_path=output_path,
+            overwrite=overwrite,
+            overwrite_source=overwrite_source,
+            suffix=suffix,
+            timeout=timeout,
+            external_timeout=external_timeout,
+            jobs=jobs,
+            cancellation_context=cancellation,
+            topology_prefilter=topology_prefilter if algorithm == "autouv" else None,
+            topology_prefilter_level=(
+                topology_prefilter_level if algorithm == "autouv" else None
+            ),
+            executable_path=unwrap_exe,
+            resolution=resolution,
+            separate_hard_edges=separate_hard_edges,
+            aspect=aspect,
+            use_normals=use_normals,
+            udims=udims,
+            overlap_identical=overlap_identical,
+            overlap_mirrored=overlap_mirrored,
+            world_scale=world_scale,
+            density=density,
+            merge_meshes=merge_meshes,
+            normalize_uv=normalize_uv,
+            angle_candidates=angle_candidates,
+            rotate_method=rotate_method,
+            progress_callback=_emit_auto_uv_progress,
+        )
+        output(
+            result,
+            f"AutoUV batch complete: {result['success_count']}/{result['total']} succeeded, "
+            f"{result.get('skipped_count', 0)} skipped, "
+            f"{result.get('cancelled_count', 0)} cancelled",
+        )
+        if result.get("cancelled"):
+            raise click.exceptions.Exit(130)
+        if result.get("failure_count", 0) or result.get("skipped_count", 0):
+            raise click.exceptions.Exit(1)
+    finally:
+        for signum, handler in previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+        cancellation.close(remove_state=True)
 
 
 @cli.group("preview")

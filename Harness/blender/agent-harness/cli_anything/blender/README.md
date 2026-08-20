@@ -221,6 +221,7 @@ cli-anything-blender fbx smart-uv-project .\model.fbx --overwrite-source
 cli-anything-blender fbx auto-uv .\model.fbx
 cli-anything-blender fbx auto-uv .\model.fbx --algorithm autouv --suffix _autouv --unwrap-exe .\cli_anything\blender\third_party\MinistryOfFlat\UnWrapConsole3.exe
 cli-anything-blender fbx auto-uv .\model.fbx --algorithm autouv --output .\output\model_autouv.fbx --resolution 2048 --udims 2 --separate-hard-edges
+cli-anything-blender fbx auto-uv .\model.fbx --no-merge-meshes --no-normalize-uv --timeout 600 --external-timeout 180
 cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform
 cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform --suffix _uv
 cli-anything-blender fbx auto-uv .\model.fbx --algorithm uniform --output .\output\model_uniform_uv.fbx --overwrite
@@ -260,14 +261,23 @@ non-source outputs require `--overwrite`; `--overwrite-source` remains accepted
 as an explicit compatibility flag for the in-place mode.
 
 `fbx auto-uv --algorithm autouv` uses the Ministry of Flat `UnWrapConsole3.exe` bundled inside the
-Harness package at `cli_anything/blender/third_party/MinistryOfFlat/` through a
-temporary OBJ round-trip for each unique mesh datablock. It overwrites the
-active UV Map in place, preserves other UV Maps and scene structure, and then
-performs the same FBX round-trip validation. For standalone installations,
-`--unwrap-exe` or `MINISTRY_OF_FLAT_EXE` can override the bundled executable.
-When `UDIMS=1` and `WORLDSCALE=FALSE`, CLI normalizes each generated UV layer
-proportionally into one `0-1` tile with a small margin; UDIM and world-scale
-outputs retain their original coordinate range.
+Harness package at `cli_anything/blender/third_party/MinistryOfFlat/`. By default, when `UDIMS=1`,
+all unique Mesh datablocks in each FBX are converted to one temporary world-space OBJ and the
+external program is called once. The result is strictly checked for unchanged vertices, face order,
+corner counts and topology before its UVs are mapped back to the original active UV Maps. Use
+`--no-merge-meshes` for independent per-Mesh calls. `--merge-meshes` never merges different input
+FBX files. Other UV Maps and scene structure are preserved.
+
+When `UDIMS=1`, UV normalization is enabled by default and can be disabled with
+`--no-normalize-uv`. Merged mode applies one uniform transform to all Meshes; non-merged mode
+normalizes each Mesh independently. The transform uses the same margin `1 / resolution` and does
+not rearrange islands. `UDIMS>1` always skips both merging and normalization to preserve UDIM
+coordinates. World-scale UV remains compatible with normalization, but normalization can change
+absolute texel density and the result reports a warning. Blender `Pack Islands` is not used.
+
+For standalone installations, `--unwrap-exe` or `MINISTRY_OF_FLAT_EXE` can override the bundled
+executable. The per-file Blender timeout defaults to 300 seconds and the external process timeout
+defaults to 120 seconds; both are configurable without a fixed 10-second cap.
 The default external settings are resolution 1024, one UDIM, square pixels,
 and all overlap, world-scale, normals, and hard-edge options disabled. Common
 settings can be changed with `--resolution`, `--separate-hard-edges`, `--aspect`,
@@ -299,8 +309,8 @@ summary contains `success_count`, `failure_count`, and `skipped_count`.
 AutoUV always sends the original imported mesh topology to Ministry of Flat.
 The Harness does not triangulate or clean a derived temporary mesh; it validates
 the returned OBJ topology and copies its UVs directly to the active UV map.
-Each AutoUV input FBX has a hard 10-second processing
-budget covering Blender import, temporary mesh work, the external call, FBX
+Each AutoUV input FBX uses a configurable processing budget (300 seconds by
+default) covering Blender import, temporary mesh work, the external call, FBX
 export, and round-trip validation. If the budget is exceeded, that FBX is
 skipped without committing an output and the batch continues. The external
 process is launched with a controllable `Popen` lifetime; on timeout the Windows
@@ -312,7 +322,12 @@ default. Use `--jobs 1` for serial processing or increase `--jobs` when the
 machine has sufficient CPU and memory. Files are scheduled independently, the
 final JSON results remain in input order, and progress events include the
 completed-file count. A failed or timed-out worker releases its slot so later
-files continue processing.
+files continue processing. Use the GUI's internal `--cancel-file` mechanism or
+send `Ctrl+C`/`SIGTERM` to request cooperative cancellation. The CLI stops
+submitting new files, terminates each registered Blender process tree, removes
+uncommitted temporary outputs, and returns `cancelled_count` with exit code
+`130`. Successfully committed files remain intact; a forced process-tree kill
+is only used as a last resort.
 
 Both algorithms support multiple FBX inputs in one invocation. Without an
 output option each source is replaced after successful validation. Use

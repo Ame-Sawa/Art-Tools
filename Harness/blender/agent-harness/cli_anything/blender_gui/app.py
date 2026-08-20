@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -64,6 +65,7 @@ STATUS_COLORS = {
     "跳过": QColor("#FCE4D6"),
     "处理中": QColor("#D9EAF7"),
     "待处理": QColor("#FFF2CC"),
+    "已取消": QColor("#D9D9D9"),
     "日志": QColor("#E7E6E6"),
 }
 
@@ -193,6 +195,10 @@ class UniformUVWindow(QMainWindow):
         self._stderr = ""
         self._stderr_buffer = ""
         self._cancel_requested = False
+        self._force_kill_requested = False
+        self._close_after_process = False
+        self._cancel_file: Optional[str] = None
+        self._cancel_dir: Optional[str] = None
         self._progress_total = 0
         self._progress_completed = 0
         self._output_mode = "source"
@@ -237,13 +243,13 @@ class UniformUVWindow(QMainWindow):
         self.rotate_combo.addItem("垂直对齐", "AXIS_ALIGNED_Y")
 
         self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(1, 10)
-        self.timeout_spin.setValue(10)
+        self.timeout_spin.setRange(1, 86400)
+        self.timeout_spin.setValue(300)
         self.timeout_spin.setSuffix(" 秒")
 
         self.external_timeout_spin = QSpinBox()
-        self.external_timeout_spin.setRange(1, 10)
-        self.external_timeout_spin.setValue(10)
+        self.external_timeout_spin.setRange(1, 86400)
+        self.external_timeout_spin.setValue(120)
         self.external_timeout_spin.setSuffix(" 秒")
 
         self.parallel_jobs_spin = QSpinBox()
@@ -270,6 +276,17 @@ class UniformUVWindow(QMainWindow):
         self.overlap_identical_check = QCheckBox("重叠相同部件")
         self.overlap_mirrored_check = QCheckBox("重叠镜像部件")
         self.world_scale_check = QCheckBox("按世界尺度展开")
+        self.merge_meshes_check = QCheckBox("跨 Mesh 合并调用")
+        self.merge_meshes_check.setChecked(True)
+        self.normalize_uv_check = QCheckBox("UV 归一化")
+        self.normalize_uv_check.setChecked(True)
+        self.autouv_status_label = QLabel()
+        self.autouv_status_label.setWordWrap(True)
+        self.autouv_status_label.setObjectName("autouv_status_label")
+        self.udims_spin.valueChanged.connect(lambda _value: self._refresh_autouv_status())
+        self.world_scale_check.toggled.connect(lambda _checked: self._refresh_autouv_status())
+        self.merge_meshes_check.toggled.connect(lambda _checked: self._refresh_autouv_status())
+        self.normalize_uv_check.toggled.connect(lambda _checked: self._refresh_autouv_status())
         self.topology_prefilter_combo = QComboBox()
         self.topology_prefilter_combo.setObjectName("topology_prefilter_level")
         self.topology_prefilter_combo.addItem("关闭", "off")
@@ -378,10 +395,13 @@ class UniformUVWindow(QMainWindow):
             self.overlap_identical_check,
             self.overlap_mirrored_check,
             self.world_scale_check,
+            self.merge_meshes_check,
+            self.normalize_uv_check,
         ):
             checks_row.addWidget(check)
         checks_row.addStretch(1)
         autouv_layout.addLayout(checks_row)
+        autouv_layout.addWidget(self.autouv_status_label)
         root.addWidget(self.autouv_options_group)
 
         runtime_group = QGroupBox("运行设置")
@@ -468,9 +488,20 @@ class UniformUVWindow(QMainWindow):
             value = values.get(key)
             if isinstance(value, bool):
                 widget.setChecked(value)
+        merge_meshes = values.get("merge_meshes")
+        if not isinstance(merge_meshes, bool):
+            merge_meshes = values.get("global_pack", True)
+        if isinstance(merge_meshes, bool):
+            self.merge_meshes_check.setChecked(merge_meshes)
+        normalize_uv = values.get("normalize_uv", True)
+        if isinstance(normalize_uv, bool):
+            self.normalize_uv_check.setChecked(normalize_uv)
         external_timeout = values.get("external_timeout")
         if isinstance(external_timeout, int) and external_timeout > 0:
-            self.external_timeout_spin.setValue(min(external_timeout, 10))
+            self.external_timeout_spin.setValue(min(external_timeout, 86400))
+        timeout = values.get("timeout")
+        if isinstance(timeout, int) and timeout > 0:
+            self.timeout_spin.setValue(min(timeout, 86400))
         parallel_jobs = values.get("parallel_jobs")
         if isinstance(parallel_jobs, int) and parallel_jobs > 0:
             self.parallel_jobs_spin.setValue(min(parallel_jobs, 16))
@@ -491,12 +522,16 @@ class UniformUVWindow(QMainWindow):
             "udims": self.udims_spin.value(),
             "density": self.density_spin.value(),
             "external_timeout": self.external_timeout_spin.value(),
+            "timeout": self.timeout_spin.value(),
             "parallel_jobs": self.parallel_jobs_spin.value(),
             "separate_hard_edges": self.separate_edges_check.isChecked(),
             "use_normals": self.normals_check.isChecked(),
             "overlap_identical": self.overlap_identical_check.isChecked(),
             "overlap_mirrored": self.overlap_mirrored_check.isChecked(),
             "world_scale": self.world_scale_check.isChecked(),
+            "merge_meshes": self.merge_meshes_check.isChecked(),
+            "normalize_uv": self.normalize_uv_check.isChecked(),
+            "global_pack": self.merge_meshes_check.isChecked(),
             "topology_prefilter_level": self.topology_prefilter_combo.currentData(),
             # Keep the old key for settings written by older GUI versions.
             "topology_prefilter": self.topology_prefilter_combo.currentData() != "off",
@@ -517,6 +552,7 @@ class UniformUVWindow(QMainWindow):
         self.setWindowTitle("Blender AutoUV" if is_autouv else "Blender Uniform UV")
         self._output_suffix = "_autouv" if is_autouv else "_uv"
         self._sync_output_controls()
+        self._refresh_autouv_status()
         self._refresh_batch_summary()
         self._refresh_ready_state()
 
@@ -574,6 +610,27 @@ class UniformUVWindow(QMainWindow):
         running = self.process is not None and self.process.state() != QProcess.NotRunning
         self.run_button.setEnabled(bool(self.batch_paths) and output_ready and not running)
 
+    def _refresh_autouv_status(self) -> None:
+        if not hasattr(self, "autouv_status_label"):
+            return
+        if self.udims_spin.value() > 1:
+            text = "当前：UDIM>1，逐 Mesh 调用 AutoUV，跳过 UV 归一化"
+        elif self.merge_meshes_check.isChecked() and self.normalize_uv_check.isChecked():
+            text = "当前：跨 Mesh 合并展开并归一化 UV"
+        elif self.merge_meshes_check.isChecked():
+            text = "当前：跨 Mesh 合并展开，不归一化 UV"
+        elif self.normalize_uv_check.isChecked():
+            text = "当前：逐 Mesh 展开并归一化 UV"
+        else:
+            text = "当前：逐 Mesh 展开，不归一化 UV"
+        if (
+            self.udims_spin.value() == 1
+            and self.world_scale_check.isChecked()
+            and self.normalize_uv_check.isChecked()
+        ):
+            text += "（绝对纹素密度可能改变）"
+        self.autouv_status_label.setText(text)
+
     def _set_workflow_controls_enabled(self, enabled: bool) -> None:
         controls = (
             self.algorithm_combo,
@@ -592,6 +649,8 @@ class UniformUVWindow(QMainWindow):
             self.overlap_identical_check,
             self.overlap_mirrored_check,
             self.world_scale_check,
+            self.merge_meshes_check,
+            self.normalize_uv_check,
             self.topology_prefilter_combo,
             self.timeout_spin,
             self.output_source_radio,
@@ -657,6 +716,8 @@ class UniformUVWindow(QMainWindow):
             overlap_mirrored=self.overlap_mirrored_check.isChecked(),
             world_scale=self.world_scale_check.isChecked(),
             density=self.density_spin.value(),
+            merge_meshes=self.merge_meshes_check.isChecked(),
+            normalize_uv=self.normalize_uv_check.isChecked(),
             topology_prefilter_level=(
                 self.topology_prefilter_combo.currentData()
                 if self._algorithm == "autouv" else "off"
@@ -710,7 +771,12 @@ class UniformUVWindow(QMainWindow):
 
         self._save_settings()
         invocation = resolve_cli_invocation()
-        args = list(invocation.prefix_args) + build_batch_uv_args(request)
+        self._cancel_dir = tempfile.mkdtemp(prefix="blender-autouv-gui-")
+        self._cancel_file = os.path.join(self._cancel_dir, "cancel.marker")
+        args = list(invocation.prefix_args) + build_batch_uv_args(
+            request,
+            cancel_file=self._cancel_file,
+        )
         self.process = QProcess(self)
         self.process.setProgram(invocation.program)
         self.process.setArguments(args)
@@ -730,6 +796,7 @@ class UniformUVWindow(QMainWindow):
         self._stderr = ""
         self._stderr_buffer = ""
         self._cancel_requested = False
+        self._force_kill_requested = False
         self._progress_total = len(self.batch_paths)
         self._progress_completed = 0
         self._clear_activity_table()
@@ -751,6 +818,14 @@ class UniformUVWindow(QMainWindow):
         self.activity_table.setRowCount(0)
         self._activity_rows.clear()
         self._activity_log_count = 0
+
+    def _cleanup_cancel_run(self) -> None:
+        cancel_dir = self._cancel_dir
+        self._cancel_file = None
+        self._cancel_dir = None
+        if cancel_dir:
+            import shutil
+            shutil.rmtree(cancel_dir, ignore_errors=True)
 
     @staticmethod
     def _path_key(path: str) -> str:
@@ -848,6 +923,11 @@ class UniformUVWindow(QMainWindow):
             self.status_label.setText(f"批处理开始：共 {total} 个文件，并行 {jobs}。")
             return
 
+        if event_name == "batch_cancel_requested":
+            self.status_label.setText("正在取消并清理进程…")
+            self._append_activity_log("CLI 已收到取消请求，正在清理活动进程。")
+            return
+
         if event_name == "file_started":
             index = event.get("index", 0)
             total = event.get("total", self._progress_total)
@@ -885,11 +965,16 @@ class UniformUVWindow(QMainWindow):
                 f"；耗时 {float(duration):.2f} 秒"
                 if isinstance(duration, (int, float)) else ""
             )
-            if event.get("skipped"):
+            if event.get("cancelled"):
+                detail = str(event.get("error") or "文件在批处理取消时未完成")
+                self._set_activity_row(
+                    input_path, index, "已取消", output_path, detail + duration_text,
+                )
+            elif event.get("skipped"):
                 skip_reason = event.get("skip_reason")
                 if skip_reason == "processing_timeout":
                     detail = event.get("error") or (
-                        f"单个 FBX 处理超过 {event.get('timeout_seconds', 10)} 秒"
+                        f"单个 FBX 处理超过 {event.get('timeout_seconds', 300)} 秒"
                     )
                     cleanup = event.get("process_cleanup")
                     if cleanup and "process cleanup" not in detail.lower():
@@ -948,13 +1033,15 @@ class UniformUVWindow(QMainWindow):
             self.status_label.setText(
                 f"批处理阶段完成：成功 {event.get('success_count', 0)}，"
                 f"失败 {event.get('failure_count', 0)}，"
-                f"跳过 {event.get('skipped_count', 0)}，共 {total} 个文件。"
+                f"跳过 {event.get('skipped_count', 0)}，"
+                f"取消 {event.get('cancelled_count', 0)}，共 {total} 个文件。"
             )
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
         if error == QProcess.FailedToStart:
             self.status_label.setText("无法启动 CLI，请检查 Python/CLI 安装。")
             self._append_activity_log("启动失败：请确认 agent-harness 的 .venv 已初始化。")
+            self._cleanup_cancel_run()
 
     def _update_activity_from_result(self, result: dict) -> None:
         for index, item in enumerate(result.get("results") or [], 1):
@@ -967,7 +1054,20 @@ class UniformUVWindow(QMainWindow):
                 f"；耗时 {float(duration):.2f} 秒"
                 if isinstance(duration, (int, float)) else ""
             )
-            if item.get("skipped"):
+            if item.get("cancelled"):
+                cleanup = item.get("process_cleanup") or []
+                cleanup_text = ""
+                if cleanup:
+                    cleanup_text = f"；清理进程 {len(cleanup)} 个"
+                self._set_activity_row(
+                    input_path,
+                    int(item.get("index") or index),
+                    "已取消",
+                    str(item.get("output_fbx") or ""),
+                    str(item.get("error") or "文件在批处理取消时未完成")
+                    + cleanup_text + duration_text,
+                )
+            elif item.get("skipped"):
                 if item.get("skip_reason") == "topology_risk":
                     rules = preflight.get("triggered_rules") or []
                     rule_text = ", ".join(
@@ -995,6 +1095,13 @@ class UniformUVWindow(QMainWindow):
             elif item.get("ok"):
                 warnings = item.get("warnings") or []
                 detail = "处理完成"
+                pipeline = item.get("result") or {}
+                if pipeline.get("algorithm") == "autouv":
+                    merge_text = "合并调用" if pipeline.get("merge_meshes_applied") else "逐 Mesh 调用"
+                    detail += (
+                        f"；{merge_text} {pipeline.get('external_call_count', 0)} 次"
+                        f"；归一化 {pipeline.get('normalized_meshes', 0)} 个 Mesh"
+                    )
                 if warnings:
                     detail += "；预警：" + " | ".join(str(value) for value in warnings)
                 self._set_activity_row(
@@ -1022,8 +1129,33 @@ class UniformUVWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
 
         if canceled:
-            self.status_label.setText("任务已取消。")
-            self._append_activity_log("用户取消了任务。")
+            try:
+                result = parse_cli_json(raw_stdout)
+            except ValueError:
+                result = None
+            if isinstance(result, dict) and "results" in result:
+                self._update_activity_from_result(result)
+                total = int(result.get("total") or self._progress_total or 1)
+                self._progress_total = max(total, 1)
+                self._progress_completed = total
+                self.progress.setRange(0, self._progress_total)
+                self.progress.setValue(self._progress_total)
+                self.status_label.setText(
+                    f"已取消：成功 {result.get('success_count', 0)}，"
+                    f"失败 {result.get('failure_count', 0)}，"
+                    f"跳过 {result.get('skipped_count', 0)}，"
+                    f"取消 {result.get('cancelled_count', 0)}。"
+                )
+                self._append_activity_log(
+                    f"批处理已取消：成功 {result.get('success_count', 0)}，"
+                    f"失败 {result.get('failure_count', 0)}，"
+                    f"跳过 {result.get('skipped_count', 0)}，"
+                    f"取消 {result.get('cancelled_count', 0)}。"
+                )
+            else:
+                status = "已强制终止，无法获得完整 CLI 摘要。" if self._force_kill_requested else "任务已取消。"
+                self.status_label.setText(status)
+                self._append_activity_log(status)
         elif exit_code != 0:
             try:
                 result = parse_cli_json(raw_stdout)
@@ -1038,7 +1170,10 @@ class UniformUVWindow(QMainWindow):
                 self.progress.setValue(self._progress_total)
                 failures = int(result.get("failure_count") or 0)
                 skipped = int(result.get("skipped_count") or 0)
-                if failures:
+                cancelled_count = int(result.get("cancelled_count") or 0)
+                if result.get("cancelled") or cancelled_count:
+                    status = "批处理已取消"
+                elif failures:
                     status = f"批处理完成，但有文件失败（退出码 {exit_code}）"
                 elif skipped:
                     status = f"批处理完成，但有文件跳过（退出码 {exit_code}）"
@@ -1048,7 +1183,8 @@ class UniformUVWindow(QMainWindow):
                 self._append_activity_log(
                     f"批处理结束：成功 {result.get('success_count', 0)}，"
                     f"失败 {result.get('failure_count', 0)}，"
-                    f"跳过 {result.get('skipped_count', 0)}，共 {total} 个文件。"
+                    f"跳过 {result.get('skipped_count', 0)}，"
+                    f"取消 {result.get('cancelled_count', 0)}，共 {total} 个文件。"
                 )
             else:
                 message = self._error_message(raw_stdout, self._stderr, exit_code)
@@ -1080,7 +1216,11 @@ class UniformUVWindow(QMainWindow):
 
         self.process.deleteLater()
         self.process = None
+        self._cleanup_cancel_run()
         self._refresh_ready_state()
+        if self._close_after_process:
+            self._close_after_process = False
+            self.close()
 
     @staticmethod
     def _error_message(
@@ -1119,11 +1259,17 @@ class UniformUVWindow(QMainWindow):
                 f"成功：{result.get('success_count', 0)}",
                 f"失败：{result.get('failure_count', 0)}",
                 f"跳过：{result.get('skipped_count', 0)}",
+                f"取消：{result.get('cancelled_count', 0)}",
                 "",
                 "逐文件结果：",
             ]
             for item in result.get("results", []):
-                if item.get("skipped"):
+                if item.get("cancelled"):
+                    lines.append(
+                        f"[已取消] {item.get('input_fbx', '')}\n"
+                        f"  {item.get('error') or '文件在批处理取消时未完成'}"
+                    )
+                elif item.get("skipped"):
                     skip_reason = item.get("skip_reason")
                     if skip_reason == "processing_timeout":
                         cleanup = item.get("process_cleanup") or {}
@@ -1136,7 +1282,7 @@ class UniformUVWindow(QMainWindow):
                             )
                         lines.append(
                             f"[跳过] {item.get('input_fbx', '')}\n"
-                            f"  原因：单个 FBX 处理超过 {item.get('timeout_seconds', 10)} 秒\n"
+                            f"  原因：单个 FBX 处理超过 {item.get('timeout_seconds', 300)} 秒\n"
                             f"  详情：{item.get('error') or '未提供超时阶段'}"
                             f"{cleanup_text}"
                         )
@@ -1185,7 +1331,10 @@ class UniformUVWindow(QMainWindow):
                 f"网格对象：{result.get('mesh_objects', '')}",
                 f"唯一 Mesh：{result.get('unique_mesh_datablocks', '')}",
                 f"UV Loop：{result.get('uv_loop_count', '')}",
+                f"跨 Mesh 合并调用：{'已执行' if result.get('merge_meshes_applied') else '未执行'}"
+                f"（外部调用 {result.get('external_call_count', 0)} 次）",
                 f"归一化到 0-1 Tile：{result.get('normalized_meshes', 0)} 个 Mesh",
+                f"UV 归一化：{'已执行' if result.get('normalize_uv_applied') else '未执行'}",
                 f"活动 UV Map：{', '.join(result.get('active_uv_maps', []))}",
                 f"AutoUV 程序：{result.get('external_executable', '')}",
                 "",
@@ -1225,13 +1374,19 @@ class UniformUVWindow(QMainWindow):
         if self.process is None or self.process.state() == QProcess.NotRunning:
             return
         self._cancel_requested = True
-        self.status_label.setText("正在取消…")
+        self.status_label.setText("正在取消并清理进程…")
         self.cancel_button.setEnabled(False)
-        self.process.terminate()
-        QTimer.singleShot(2000, self._kill_if_running)
+        if self._cancel_file:
+            try:
+                Path(self._cancel_file).write_text("cancel\n", encoding="utf-8")
+            except OSError as error:
+                self._append_activity_log(f"无法写入取消请求：{error}")
+        QTimer.singleShot(5000, self._kill_if_running)
 
     def _kill_if_running(self) -> None:
         if self.process is not None and self.process.state() != QProcess.NotRunning:
+            self._force_kill_requested = True
+            self.status_label.setText("正在强制终止 CLI 及其子进程…")
             pid = int(self.process.processId() or 0)
             if os.name == "nt" and pid:
                 try:
@@ -1259,7 +1414,10 @@ class UniformUVWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 event.ignore()
                 return
-            self._kill_if_running()
+            self._close_after_process = True
+            self._cancel()
+            event.ignore()
+            return
         event.accept()
 
 

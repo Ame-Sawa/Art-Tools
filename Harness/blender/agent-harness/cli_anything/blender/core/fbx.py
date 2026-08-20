@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -37,13 +38,17 @@ MINISTRY_OF_FLAT_DEFAULTS = {
     "overlap_mirrored": False,
     "world_scale": False,
     "density": 1024,
+    # AutoUV pipeline options.  They are kept alongside the external options
+    # so the generated Blender script has one validated configuration object.
+    "merge_meshes": True,
+    "normalize_uv": True,
 }
 AUTO_UV_SINGLE_TILE_MARGIN = 0.001
 TOPOLOGY_PREFILTER_DEFAULT = True
 TOPOLOGY_PREFILTER_LEVELS = ("off", "high", "medium")
 TOPOLOGY_RISK_VERSION = 2
 TOPOLOGY_RISK_THRESHOLD = 7
-AUTO_UV_FILE_TIMEOUT = 10
+AUTO_UV_FILE_TIMEOUT = 300
 
 
 def _topology_risk_level(score: int) -> str:
@@ -203,6 +208,8 @@ def _validate_ministry_of_flat_options(options: Optional[Dict[str, object]] = No
         "overlap_identical",
         "overlap_mirrored",
         "world_scale",
+        "merge_meshes",
+        "normalize_uv",
     ):
         values[key] = bool(values[key])
     return values
@@ -521,10 +528,23 @@ def _parse_script_marker(stdout: str, marker: str) -> Dict[str, object]:
     raise RuntimeError(f"Blender script did not emit {marker}.")
 
 
-def _run_blender_script(script: str, timeout: int, operation: str) -> Dict[str, object]:
+def _run_blender_script(
+    script: str,
+    timeout: int,
+    operation: str,
+    *,
+    cancellation_context=None,
+    input_fbx: Optional[str] = None,
+) -> Dict[str, object]:
     from cli_anything.blender.utils.blender_backend import run_blender_script
 
-    result = run_blender_script(script, timeout=timeout)
+    result = run_blender_script(
+        script,
+        timeout=timeout,
+        cancellation=cancellation_context,
+        input_fbx=input_fbx,
+        operation=operation,
+    )
     stdout = str(result.get("stdout", "") or "")
     stderr = str(result.get("stderr", "") or "")
     if result["returncode"] != 0:
@@ -636,6 +656,7 @@ def export_fbx_auto_uniform_uv(
     timeout: int = 300,
     angle_candidates: Optional[Sequence[float]] = None,
     rotate_method: Optional[str] = None,
+    cancellation_context=None,
 ) -> Dict[str, object]:
     """Auto-select a Smart UV angle for uniform checkerboard distortion."""
     fbx_path = os.path.abspath(fbx_path)
@@ -681,6 +702,8 @@ def export_fbx_auto_uniform_uv(
     )
     os.close(temp_handle)
     os.unlink(staging_path)
+    if cancellation_context is not None:
+        cancellation_context.register_temp_path(staging_path)
 
     file_started_at = time.monotonic()
 
@@ -715,6 +738,8 @@ def export_fbx_auto_uniform_uv(
                 export_script,
                 min(float(timeout), remaining),
                 "FBX auto uniform UV export",
+                cancellation_context=cancellation_context,
+                input_fbx=fbx_path,
             )
         except subprocess.TimeoutExpired:
             return timeout_result("Blender Uniform UV export")
@@ -731,6 +756,8 @@ def export_fbx_auto_uniform_uv(
                 validation_script,
                 min(float(timeout), remaining),
                 "FBX round-trip validation",
+                cancellation_context=cancellation_context,
+                input_fbx=fbx_path,
             )
         except subprocess.TimeoutExpired:
             return timeout_result("FBX round-trip validation")
@@ -764,6 +791,8 @@ def export_fbx_auto_uniform_uv(
     finally:
         if os.path.exists(staging_path):
             os.unlink(staging_path)
+        if cancellation_context is not None:
+            cancellation_context.unregister_temp_path(staging_path)
 
 
 def _export_fbx_ministry_auto_uv(
@@ -778,6 +807,7 @@ def _export_fbx_ministry_auto_uv(
     executable_path: Optional[str] = None,
     topology_prefilter: Optional[bool] = None,
     topology_prefilter_level: Optional[str] = None,
+    cancellation_context=None,
     **auto_uv_options,
 ) -> Dict[str, object]:
     """Run Ministry of Flat AutoUV for every unique mesh in an FBX."""
@@ -825,6 +855,11 @@ def _export_fbx_ministry_auto_uv(
     )
     os.close(temp_handle)
     os.unlink(staging_path)
+    if cancellation_context is not None:
+        cancellation_context.register_temp_path(staging_path)
+    temporary_root = None
+    if cancellation_context is not None:
+        temporary_root = cancellation_context.create_temp_dir("blender-task-")
 
     file_started_at = time.monotonic()
 
@@ -853,14 +888,18 @@ def _export_fbx_ministry_auto_uv(
             staging_path,
             executable_path=executable,
             external_timeout=external_timeout,
+            file_timeout=timeout,
             auto_uv_options=options,
             topology_prefilter_level=resolved_prefilter_level,
+            temporary_root=temporary_root,
         )
         try:
             export_run = _run_blender_script(
                 export_script,
                 min(float(timeout), remaining),
                 "FBX AutoUV export",
+                cancellation_context=cancellation_context,
+                input_fbx=fbx_path,
             )
         except subprocess.TimeoutExpired:
             return timeout_result("Blender AutoUV export")
@@ -896,6 +935,8 @@ def _export_fbx_ministry_auto_uv(
                 validation_script,
                 min(float(timeout), remaining),
                 "FBX AutoUV round-trip validation",
+                cancellation_context=cancellation_context,
+                input_fbx=fbx_path,
             )
         except subprocess.TimeoutExpired:
             return timeout_result("FBX round-trip validation")
@@ -915,6 +956,14 @@ def _export_fbx_ministry_auto_uv(
             "unique_mesh_datablocks": export_summary["unique_mesh_datablocks"],
             "processed_mesh_objects": export_summary["processed_mesh_objects"],
             "normalized_meshes": export_summary.get("normalized_meshes", 0),
+            "external_call_count": export_summary.get("external_call_count", 0),
+            "merge_meshes_requested": export_summary.get("merge_meshes_requested"),
+            "merge_meshes_applied": export_summary.get("merge_meshes_applied"),
+            "merge_mesh_count": export_summary.get("merge_mesh_count", 0),
+            "normalize_uv_requested": export_summary.get("normalize_uv_requested"),
+            "normalize_uv_applied": export_summary.get("normalize_uv_applied"),
+            "normalization_skipped_reason": export_summary.get("normalization_skipped_reason"),
+            "normalization_margin": export_summary.get("normalization_margin"),
             "uv_loop_count": export_summary["uv_loop_count"],
             "active_uv_maps": export_summary["active_uv_maps"],
             "external_executable": executable,
@@ -928,6 +977,11 @@ def _export_fbx_ministry_auto_uv(
     finally:
         if os.path.exists(staging_path):
             os.unlink(staging_path)
+        if cancellation_context is not None and temporary_root:
+            shutil.rmtree(temporary_root, ignore_errors=True)
+            cancellation_context.unregister_temp_path(temporary_root)
+        if cancellation_context is not None:
+            cancellation_context.unregister_temp_path(staging_path)
 
 
 def _validate_auto_uv_algorithm(algorithm: str) -> str:
@@ -951,6 +1005,7 @@ def export_fbx_auto_uv(
     executable_path: Optional[str] = None,
     topology_prefilter: Optional[bool] = None,
     topology_prefilter_level: Optional[str] = None,
+    cancellation_context=None,
     angle_candidates: Optional[Sequence[float]] = None,
     rotate_method: Optional[str] = None,
     **auto_uv_options,
@@ -974,6 +1029,7 @@ def export_fbx_auto_uv(
             timeout=timeout,
             angle_candidates=angle_candidates,
             rotate_method=rotate_method,
+            cancellation_context=cancellation_context,
         )
         result["algorithm"] = selected_algorithm
         return result
@@ -991,6 +1047,7 @@ def export_fbx_auto_uv(
         executable_path=executable_path,
         topology_prefilter=topology_prefilter,
         topology_prefilter_level=topology_prefilter_level,
+        cancellation_context=cancellation_context,
         **auto_uv_options,
     )
     result["algorithm"] = selected_algorithm
@@ -1070,9 +1127,12 @@ def export_fbx_auto_uv_batch(
     rotate_method: Optional[str] = None,
     progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     jobs: int = 2,
+    cancellation_context=None,
     **auto_uv_options,
 ) -> Dict[str, object]:
     """Process one or more FBX files and return an aggregate result."""
+    from cli_anything.blender.utils.blender_backend import CancellationRequested
+
     selected_algorithm = _validate_auto_uv_algorithm(algorithm)
     inputs = _normalize_batch_inputs(fbx_paths)
     try:
@@ -1113,6 +1173,18 @@ def export_fbx_auto_uv_batch(
             # Progress reporting must never change the processing result.
             return
 
+    cancellation_notified = False
+
+    def cancellation_requested() -> bool:
+        nonlocal cancellation_notified
+        if cancellation_context is None or not cancellation_context.is_cancelled():
+            return False
+        if not cancellation_notified:
+            notify("batch_cancel_requested", total=total)
+            cancellation_notified = True
+        cancellation_context.terminate_all()
+        return True
+
     total = len(inputs)
     notify(
         "batch_started",
@@ -1126,18 +1198,21 @@ def export_fbx_auto_uv_batch(
     def process_one(index: int, source_path: str, per_file_output: Optional[str]) -> Dict[str, object]:
         started_at = time.monotonic()
         try:
+            if cancellation_requested():
+                raise CancellationRequested("batch cancellation requested before file start")
             result = export_fbx_auto_uv(
                 source_path,
                 per_file_output,
                 algorithm=selected_algorithm,
                 overwrite=overwrite,
                 overwrite_source=overwrite_source,
-                suffix=None if output_dir is not None else suffix,
+                suffix=None if per_file_output is not None else suffix,
                 timeout=timeout,
                 external_timeout=external_timeout,
                 executable_path=executable_path,
                 topology_prefilter=None,
                 topology_prefilter_level=resolved_prefilter_level,
+                cancellation_context=cancellation_context,
                 angle_candidates=angle_candidates,
                 rotate_method=rotate_method,
                 **auto_uv_options,
@@ -1184,8 +1259,57 @@ def export_fbx_auto_uv_batch(
                     "duration_seconds": duration_seconds,
                 },
             }
+        except CancellationRequested as error:
+            duration_seconds = round(time.monotonic() - started_at, 3)
+            return {
+                "index": index,
+                "input_fbx": source_path,
+                "item": {
+                    "input_fbx": source_path,
+                    "ok": False,
+                    "cancelled": True,
+                    "skip_reason": "cancelled",
+                    "error": str(error),
+                    "process_cleanup": list(cancellation_context.cleanup_reports)
+                    if cancellation_context else [],
+                    "duration_seconds": duration_seconds,
+                },
+                "event": {
+                    "ok": False,
+                    "cancelled": True,
+                    "skipped": False,
+                    "skip_reason": "cancelled",
+                    "error": str(error),
+                    "process_cleanup": list(cancellation_context.cleanup_reports)
+                    if cancellation_context else [],
+                    "duration_seconds": duration_seconds,
+                },
+            }
         except Exception as error:
             duration_seconds = round(time.monotonic() - started_at, 3)
+            if cancellation_requested():
+                return {
+                    "index": index,
+                    "input_fbx": source_path,
+                    "item": {
+                        "input_fbx": source_path,
+                        "ok": False,
+                        "cancelled": True,
+                        "skip_reason": "cancelled",
+                        "error": str(error),
+                        "process_cleanup": list(cancellation_context.cleanup_reports)
+                        if cancellation_context else [],
+                        "duration_seconds": duration_seconds,
+                    },
+                    "event": {
+                        "ok": False,
+                        "cancelled": True,
+                        "skipped": False,
+                        "skip_reason": "cancelled",
+                        "error": str(error),
+                        "duration_seconds": duration_seconds,
+                    },
+                }
             return {
                 "index": index,
                 "input_fbx": source_path,
@@ -1222,10 +1346,13 @@ def export_fbx_auto_uv_batch(
     active = {}
     next_index = 1
     with ThreadPoolExecutor(max_workers=effective_jobs) as executor:
-        while next_index <= total and len(active) < effective_jobs:
+        while next_index <= total and len(active) < effective_jobs and not cancellation_requested():
             next_index = submit_next(executor, active, next_index)
         while active:
-            done, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+            if cancellation_requested():
+                # Active workers observe the same event in their managed Popen loop.
+                cancellation_context.terminate_all()
+            done, _ = wait(tuple(active), timeout=0.1, return_when=FIRST_COMPLETED)
             for future in done:
                 active.pop(future)
                 processed = future.result()
@@ -1241,13 +1368,45 @@ def export_fbx_auto_uv_batch(
                     active_jobs=len(active),
                     **processed["event"],
                 )
-                if next_index <= total:
+                if next_index <= total and not cancellation_requested():
                     next_index = submit_next(executor, active, next_index)
+
+        while next_index <= total:
+            source_path = inputs[next_index - 1]
+            item = {
+                "input_fbx": source_path,
+                "ok": False,
+                "cancelled": True,
+                "skip_reason": "cancelled",
+                "error": "Batch cancelled before this file started.",
+                "process_cleanup": list(cancellation_context.cleanup_reports)
+                if cancellation_context else [],
+            }
+            results[next_index - 1] = item
+            completed_count += 1
+            notify(
+                "file_finished",
+                index=next_index,
+                total=total,
+                completed_count=completed_count,
+                input_fbx=source_path,
+                active_jobs=0,
+                ok=False,
+                cancelled=True,
+                skipped=False,
+                skip_reason="cancelled",
+                error=item["error"],
+                process_cleanup=list(cancellation_context.cleanup_reports)
+                if cancellation_context else [],
+            )
+            next_index += 1
 
     final_results = [item for item in results if item is not None]
     success_count = sum(1 for item in final_results if item["ok"])
     skipped_count = sum(1 for item in final_results if item.get("skipped"))
-    failure_count = len(results) - success_count - skipped_count
+    cancelled_count = sum(1 for item in final_results if item.get("cancelled"))
+    failure_count = len(results) - success_count - skipped_count - cancelled_count
+    cancelled = bool(cancelled_count or cancellation_requested())
     notify(
         "batch_finished",
         total=total,
@@ -1256,6 +1415,10 @@ def export_fbx_auto_uv_batch(
         success_count=success_count,
         failure_count=failure_count,
         skipped_count=skipped_count,
+        cancelled=cancelled,
+        cancelled_count=cancelled_count,
+        process_cleanup=list(cancellation_context.cleanup_reports)
+        if cancellation_context else [],
     )
     return {
         "algorithm": selected_algorithm,
@@ -1265,6 +1428,10 @@ def export_fbx_auto_uv_batch(
         "success_count": success_count,
         "failure_count": failure_count,
         "skipped_count": skipped_count,
+        "cancelled": cancelled,
+        "cancelled_count": cancelled_count,
+        "process_cleanup": list(cancellation_context.cleanup_reports)
+        if cancellation_context else [],
         "results": final_results,
     }
 
@@ -1275,9 +1442,11 @@ def generate_fbx_auto_uv_script(
     *,
     executable_path: str,
     external_timeout: int = 120,
+    file_timeout: int = AUTO_UV_FILE_TIMEOUT,
     auto_uv_options: Optional[Dict[str, object]] = None,
     topology_prefilter: Optional[bool] = None,
     topology_prefilter_level: Optional[str] = None,
+    temporary_root: Optional[str] = None,
 ) -> str:
     """Generate the standalone Blender script used by :func:`export_fbx_auto_uv`."""
     options = _validate_ministry_of_flat_options(auto_uv_options or {})
@@ -1296,7 +1465,8 @@ def generate_fbx_auto_uv_script(
         "topology_prefilter_level": resolved_prefilter_level,
         "topology_risk_version": TOPOLOGY_RISK_VERSION,
         "topology_risk_threshold": TOPOLOGY_RISK_THRESHOLD,
-        "file_timeout": AUTO_UV_FILE_TIMEOUT,
+        "file_timeout": int(file_timeout),
+        "temporary_root": os.path.abspath(temporary_root) if temporary_root else None,
     })
     script = r'''
 import bpy
@@ -1311,6 +1481,7 @@ import tempfile
 import time
 from io_scene_fbx import import_fbx, parse_fbx
 from io_scene_fbx.fbx_utils import RIGHT_HAND_AXES
+from mathutils import Vector
 
 CONFIG = __CONFIG__
 FILE_STARTED_AT = time.monotonic()
@@ -1551,8 +1722,6 @@ def normalize_uv_layer_to_single_tile(uv_layer, margin):
     max_x = max(item.uv.x for item in uv_layer.data)
     min_y = min(item.uv.y for item in uv_layer.data)
     max_y = max(item.uv.y for item in uv_layer.data)
-    if min_x >= 0.0 and max_x <= 1.0 and min_y >= 0.0 and max_y <= 1.0:
-        return False
     span_x = max_x - min_x
     span_y = max_y - min_y
     largest_span = max(span_x, span_y)
@@ -1733,10 +1902,10 @@ def copy_uv_same_topology(source_mesh, imported_mesh, target_uv):
 
 def normalize_target_uv(obj, target_uv, options):
     normalized = False
-    if options['udims'] == 1 and not options['world_scale']:
+    if options['udims'] == 1 and options['normalize_uv']:
         normalized = normalize_uv_layer_to_single_tile(
             target_uv,
-            CONFIG['single_tile_margin'],
+            1.0 / max(1, int(options['resolution'])),
         )
     obj.data.uv_layers.active_index = obj.data.uv_layers.find(target_uv.name)
     obj.data.update()
@@ -1752,6 +1921,8 @@ def process_mesh(obj, temp_root, index):
 
     export_selected_obj(obj, original_input_path)
     original_attempt = run_unwrap(original_input_path, original_output_path)
+    if original_attempt['returncode'] is None:
+        raise RuntimeError(original_attempt.get('error') or 'UnWrapConsole3.exe timed out.')
     if original_attempt['output_exists']:
         imported_objects = []
         try:
@@ -1775,6 +1946,298 @@ def process_mesh(obj, temp_root, index):
     elif original_attempt.get('error'):
         raise RuntimeError(original_attempt['error'])
     raise RuntimeError('UnWrapConsole3.exe produced no output OBJ.')
+
+def resolve_obj_index(raw_index, count):
+    index = int(raw_index)
+    if index > 0:
+        resolved = index - 1
+    elif index < 0:
+        resolved = count + index
+    else:
+        raise ValueError('OBJ index cannot be zero.')
+    if resolved < 0 or resolved >= count:
+        raise ValueError('OBJ index is out of range.')
+    return resolved
+
+def parse_obj_geometry_and_uv(path):
+    vertices = []
+    uvs = []
+    faces = []
+    with open(path, 'r', encoding='utf-8', errors='replace') as obj_file:
+        for line_number, line in enumerate(obj_file, start=1):
+            parts = line.strip().split()
+            if not parts or parts[0].startswith('#'):
+                continue
+            record = parts[0]
+            try:
+                if record == 'v':
+                    if len(parts) < 4:
+                        raise ValueError('incomplete vertex')
+                    vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                elif record == 'vt':
+                    if len(parts) < 3:
+                        raise ValueError('incomplete UV')
+                    uvs.append((float(parts[1]), float(parts[2])))
+                elif record == 'f':
+                    if len(parts) < 4:
+                        raise ValueError('face needs at least three corners')
+                    corners = []
+                    for token in parts[1:]:
+                        fields = token.split('/')
+                        vertex_index = resolve_obj_index(fields[0], len(vertices))
+                        uv_index = None
+                        if len(fields) > 1 and fields[1]:
+                            uv_index = resolve_obj_index(fields[1], len(uvs))
+                        corners.append((vertex_index, uv_index))
+                    faces.append(corners)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f'failed to parse OBJ line {line_number}: {error}'
+                ) from error
+    return {'vertices': vertices, 'uvs': uvs, 'faces': faces}
+
+def float_close(left, right, epsilon=1.0e-5):
+    return abs(left - right) <= epsilon
+
+def remove_temporary_object(obj):
+    if obj is None:
+        return
+    mesh = getattr(obj, 'data', None)
+    if obj.name in bpy.data.objects:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0 and mesh.name in bpy.data.meshes:
+        bpy.data.meshes.remove(mesh)
+    bpy.context.view_layer.update()
+
+def create_combined_object(objects, manifest_path):
+    vertices = []
+    faces = []
+    loop_sources = []
+    mesh_entries = []
+    active_uv_layers = []
+
+    for mesh_index, obj in enumerate(objects):
+        source_mesh = obj.data
+        vertex_offset = len(vertices)
+        polygon_offset = len(faces)
+        loop_offset = len(loop_sources)
+        vertices.extend(tuple(obj.matrix_world @ vertex.co) for vertex in source_mesh.vertices)
+        for polygon in source_mesh.polygons:
+            face = []
+            for loop_index in polygon.loop_indices:
+                loop = source_mesh.loops[loop_index]
+                face.append(vertex_offset + loop.vertex_index)
+                loop_sources.append({'mesh_index': mesh_index, 'loop_index': loop_index})
+            faces.append(face)
+        active_uv_layers.append(source_mesh.uv_layers.active)
+        mesh_entries.append({
+            'mesh_index': mesh_index,
+            'object_name': obj.name,
+            'mesh_name': source_mesh.name,
+            'vertex_count': len(source_mesh.vertices),
+            'polygon_count': len(source_mesh.polygons),
+            'loop_count': len(source_mesh.loops),
+            'vertex_offset': vertex_offset,
+            'polygon_offset': polygon_offset,
+            'loop_offset': loop_offset,
+        })
+
+    if not vertices or not faces or not loop_sources:
+        raise RuntimeError('selected meshes have no faces or vertices to export')
+    manifest = {
+        'version': 1,
+        'meshes': mesh_entries,
+        'loop_sources': loop_sources,
+        'vertex_count': len(vertices),
+        'polygon_count': len(faces),
+        'loop_count': len(loop_sources),
+    }
+    with open(manifest_path, 'w', encoding='utf-8') as manifest_file:
+        json.dump(manifest, manifest_file, sort_keys=True)
+
+    combined_mesh = bpy.data.meshes.new('__AutoUV_CombinedMesh')
+    combined_mesh.from_pydata(vertices, [], faces)
+    combined_mesh.update()
+    if any(layer is not None for layer in active_uv_layers):
+        combined_uv = combined_mesh.uv_layers.new(name='UVMap')
+        for combined_loop_index, source in enumerate(loop_sources):
+            source_layer = active_uv_layers[source['mesh_index']]
+            if source_layer is not None:
+                combined_uv.data[combined_loop_index].uv = source_layer.data[source['loop_index']].uv
+
+    combined_loop_normals = []
+    for obj in objects:
+        try:
+            normal_matrix = obj.matrix_world.to_3x3().inverted().transposed()
+        except ValueError:
+            normal_matrix = obj.matrix_world.to_3x3()
+        for loop in obj.data.loops:
+            world_normal = normal_matrix @ loop.normal
+            if world_normal.length <= 1.0e-8:
+                world_normal = Vector((0.0, 0.0, 1.0))
+            else:
+                world_normal.normalize()
+            combined_loop_normals.append(tuple(world_normal))
+    if len(combined_loop_normals) == len(combined_mesh.loops):
+        combined_mesh.normals_split_custom_set(combined_loop_normals)
+        combined_mesh.update()
+
+    combined_object = bpy.data.objects.new('__AutoUV_CombinedObject', combined_mesh)
+    collection = objects[0].users_collection[0] if objects[0].users_collection else bpy.context.scene.collection
+    collection.objects.link(combined_object)
+    bpy.context.view_layer.update()
+    return combined_object, manifest
+
+def validate_combined_obj_and_write_uv(objects, combined_object, input_path, output_path, manifest):
+    input_data = parse_obj_geometry_and_uv(input_path)
+    output_data = parse_obj_geometry_and_uv(output_path)
+    combined_mesh = combined_object.data
+    expected_faces = [
+        [combined_mesh.loops[index].vertex_index for index in polygon.loop_indices]
+        for polygon in combined_mesh.polygons
+    ]
+    if len(input_data['vertices']) != len(combined_mesh.vertices):
+        raise RuntimeError('input OBJ vertex count does not match manifest')
+    if len(input_data['faces']) != len(expected_faces):
+        raise RuntimeError('input OBJ face count does not match manifest')
+    if len(output_data['vertices']) != len(input_data['vertices']):
+        raise RuntimeError('external OBJ changed vertex count')
+    if len(output_data['faces']) != len(input_data['faces']):
+        raise RuntimeError('external OBJ changed face count')
+    for index, (input_vertex, output_vertex) in enumerate(zip(input_data['vertices'], output_data['vertices'])):
+        if not all(float_close(input_vertex[axis], output_vertex[axis]) for axis in range(3)):
+            raise RuntimeError(f'external OBJ changed vertex coordinates at vertex {index}')
+    for face_index, (expected_face, input_face, output_face) in enumerate(zip(expected_faces, input_data['faces'], output_data['faces'])):
+        input_vertices = [corner[0] for corner in input_face]
+        output_vertices = [corner[0] for corner in output_face]
+        if input_vertices != expected_face:
+            raise RuntimeError(f'input OBJ reordered faces or vertices at face {face_index}')
+        if output_vertices != input_vertices:
+            raise RuntimeError(f'external OBJ reordered faces or vertices at face {face_index}')
+        if len(output_face) != len(input_face):
+            raise RuntimeError(f'external OBJ changed corner count at face {face_index}')
+    if len(manifest.get('loop_sources', [])) != len(combined_mesh.loops):
+        raise RuntimeError('loop mapping count mismatch')
+
+    source_layers = [obj.data.uv_layers.active for obj in objects]
+    pending_uvs = []
+    seen_loops = set()
+    for face_index, output_face in enumerate(output_data['faces']):
+        polygon = combined_mesh.polygons[face_index]
+        for corner_index, corner in enumerate(output_face):
+            uv_index = corner[1]
+            if uv_index is None or uv_index >= len(output_data['uvs']):
+                raise RuntimeError(f'external OBJ has no valid UV index at face {face_index}')
+            combined_loop_index = polygon.loop_start + corner_index
+            source = manifest['loop_sources'][combined_loop_index]
+            source_key = (source['mesh_index'], source['loop_index'])
+            if source_key in seen_loops:
+                raise RuntimeError('loop mapping contains duplicate write targets')
+            seen_loops.add(source_key)
+            pending_uvs.append((source['mesh_index'], source['loop_index'], output_data['uvs'][uv_index]))
+    expected_loop_count = sum(len(obj.data.loops) for obj in objects)
+    if len(seen_loops) != expected_loop_count:
+        raise RuntimeError('external OBJ did not return UVs for every source loop')
+    for mesh_index, obj in enumerate(objects):
+        if source_layers[mesh_index] is None:
+            source_layers[mesh_index] = obj.data.uv_layers.new(name='UVMap')
+    for mesh_index, loop_index, uv in pending_uvs:
+        source_layers[mesh_index].data[loop_index].uv = uv
+    for mesh_index, obj in enumerate(objects):
+        obj.data.uv_layers.active_index = obj.data.uv_layers.find(source_layers[mesh_index].name)
+        obj.data.update()
+
+def normalize_meshes_globally(objects, options):
+    active_layers = []
+    min_x = float('inf')
+    min_y = float('inf')
+    max_x = float('-inf')
+    max_y = float('-inf')
+    for obj in objects:
+        uv_layer = obj.data.uv_layers.active
+        if uv_layer is None or not uv_layer.data:
+            raise RuntimeError(f'mesh {obj.name} has no active UV to normalize')
+        active_layers.append((obj.data, uv_layer))
+        for item in uv_layer.data:
+            min_x = min(min_x, item.uv.x)
+            min_y = min(min_y, item.uv.y)
+            max_x = max(max_x, item.uv.x)
+            max_y = max(max_y, item.uv.y)
+    if not active_layers:
+        raise RuntimeError('no active UV layers to normalize')
+    largest_span = max(max_x - min_x, max_y - min_y)
+    if largest_span <= 1.0e-12:
+        return False
+    margin = 1.0 / max(1, int(options['resolution']))
+    usable_size = max(1.0e-6, 1.0 - (2.0 * margin))
+    scale = usable_size / largest_span
+    center_x = (min_x + max_x) * 0.5
+    center_y = (min_y + max_y) * 0.5
+    for mesh, uv_layer in active_layers:
+        for item in uv_layer.data:
+            item.uv.x = (item.uv.x - center_x) * scale + 0.5
+            item.uv.y = (item.uv.y - center_y) * scale + 0.5
+        mesh.update()
+    return True
+
+def snapshot_uv_state(objects):
+    snapshot = []
+    for obj in objects:
+        mesh = obj.data
+        layers = []
+        for layer in mesh.uv_layers:
+            layers.append({
+                'name': layer.name,
+                'uvs': [(item.uv.x, item.uv.y) for item in layer.data],
+            })
+        snapshot.append({
+            'mesh': mesh,
+            'layers': layers,
+            'active_index': mesh.uv_layers.active_index,
+        })
+    return snapshot
+
+def restore_uv_state(snapshot):
+    for item in snapshot:
+        mesh = item['mesh']
+        while mesh.uv_layers:
+            mesh.uv_layers.remove(mesh.uv_layers[0])
+        for layer_state in item['layers']:
+            layer = mesh.uv_layers.new(name=layer_state['name'])
+            for loop_index, uv in enumerate(layer_state['uvs']):
+                if loop_index < len(layer.data):
+                    layer.data[loop_index].uv = uv
+        if mesh.uv_layers:
+            mesh.uv_layers.active_index = min(
+                item['active_index'], len(mesh.uv_layers) - 1
+            )
+        mesh.update()
+
+def process_combined(objects, temp_root, index):
+    ensure_file_time('combined mesh ' + str(index))
+    input_path = os.path.join(temp_root, f'{index:04d}_combined_input.obj')
+    output_path = os.path.join(temp_root, f'{index:04d}_combined_unwrapped.obj')
+    manifest_path = os.path.join(temp_root, f'{index:04d}_combined_manifest.json')
+    combined_object = None
+    try:
+        combined_object, manifest = create_combined_object(objects, manifest_path)
+        set_only_selected(combined_object)
+        bpy.ops.wm.obj_export(filepath=input_path, export_selected_objects=True, export_materials=False)
+        if not os.path.isfile(input_path):
+            raise RuntimeError('Blender did not produce the combined temporary OBJ.')
+        attempt = run_unwrap(input_path, output_path)
+        if attempt['returncode'] is None:
+            raise RuntimeError(attempt.get('error') or 'UnWrapConsole3.exe timed out.')
+        if not attempt['output_exists']:
+            raise RuntimeError(attempt.get('error') or 'UnWrapConsole3.exe produced no combined output OBJ.')
+        validate_combined_obj_and_write_uv(objects, combined_object, input_path, output_path, manifest)
+        return {
+            'returncode': attempt['returncode'],
+            'warning': attempt.get('error') if attempt['returncode'] not in (None, 0) else None,
+            'external_calls': 1,
+        }
+    finally:
+        remove_temporary_object(combined_object)
 
 profile = source_profile(CONFIG['fbx_path'])
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -1809,20 +2272,64 @@ if preflight['skipped']:
     # Ministry of Flat process can be started for a skipped file.
     os._exit(0)
 
-temp_root = tempfile.mkdtemp(prefix='cli_ministry_of_flat_', dir=bpy.app.tempdir)
+temp_root = CONFIG.get('temporary_root')
+if temp_root:
+    os.makedirs(temp_root, exist_ok=True)
+else:
+    temp_root = tempfile.mkdtemp(prefix='cli_ministry_of_flat_', dir=bpy.app.tempdir)
 processed = []
 warnings = []
+options = CONFIG['auto_uv_options']
+merge_requested = bool(options.get('merge_meshes', True))
+normalize_requested = bool(options.get('normalize_uv', True))
+merge_applied = bool(merge_requested and options['udims'] == 1)
+normalize_applied = False
+normalization_skipped_reason = None
+external_call_count = 0
+normalized_mesh_count = 0
+uv_snapshot = snapshot_uv_state(unique_meshes)
+if options['udims'] > 1:
+    normalization_skipped_reason = 'udims_greater_than_one'
+    if merge_requested:
+        warnings.append('UDIM>1: merge disabled and UV normalization skipped.')
+if options['world_scale'] and normalize_requested and options['udims'] == 1:
+    warnings.append('World-scale UV is normalized to 0-1; absolute texel density may change.')
 if preflight.get('risk_level') == 'medium':
     warnings.append(
         'Medium topology risk score ' + str(preflight.get('risk_score', 0)) +
         '; triggered: ' + ', '.join(preflight.get('reasons') or [])
     )
 try:
-    for index, obj in enumerate(unique_meshes, start=1):
-        result = process_mesh(obj, temp_root, index)
-        processed.append(result)
-        if result.get('returncode') not in (None, 0):
-            warnings.append(f"{obj.name}: external return code {result['returncode']} with a valid output")
+    if merge_applied:
+        combined_result = process_combined(unique_meshes, temp_root, 1)
+        external_call_count = 1
+        if combined_result.get('warning'):
+            warnings.append('Combined Meshes: ' + str(combined_result['warning']))
+        for obj in unique_meshes:
+            target_uv = ensure_target_uv(obj.data)
+            processed.append({
+                'object': obj.name,
+                'uv_map': target_uv.name,
+                'uv_loops': len(target_uv.data),
+                'normalized': False,
+            })
+        if normalize_requested:
+            normalize_applied = normalize_meshes_globally(unique_meshes, options)
+            normalized_mesh_count = len(unique_meshes) if normalize_applied else 0
+        else:
+            normalization_skipped_reason = 'disabled_by_option'
+    else:
+        for index, obj in enumerate(unique_meshes, start=1):
+            result = process_mesh(obj, temp_root, index)
+            processed.append(result)
+            external_call_count += 1
+            if result.get('returncode') not in (None, 0):
+                warnings.append(f"{obj.name}: external return code {result['returncode']} with a valid output")
+            if result.get('normalized'):
+                normalized_mesh_count += 1
+        normalize_applied = bool(normalize_requested and options['udims'] == 1 and normalized_mesh_count)
+        if not normalize_requested:
+            normalization_skipped_reason = 'disabled_by_option'
 except FileProcessingTimeout as error:
     shutil.rmtree(temp_root, ignore_errors=True)
     if os.path.exists(CONFIG['output_path']):
@@ -1836,6 +2343,11 @@ except FileProcessingTimeout as error:
         'preflight': preflight,
     }, sort_keys=True), flush=True)
     os._exit(0)
+except Exception:
+    restore_uv_state(uv_snapshot)
+    if os.path.exists(CONFIG['output_path']):
+        os.remove(CONFIG['output_path'])
+    raise
 finally:
     shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -1893,10 +2405,18 @@ result = {
     'mesh_objects': len(meshes),
     'unique_mesh_datablocks': len(unique_meshes),
     'processed_mesh_objects': len(processed),
-    'normalized_meshes': sum(1 for item in processed if item.get('normalized')),
+    'normalized_meshes': normalized_mesh_count,
     'uv_loop_count': sum(item['uv_loops'] for item in processed),
     'active_uv_maps': [item['uv_map'] for item in processed],
     'external_warnings': warnings,
+    'external_call_count': external_call_count,
+    'merge_meshes_requested': merge_requested,
+    'merge_meshes_applied': merge_applied,
+    'merge_mesh_count': len(unique_meshes) if merge_applied else 0,
+    'normalize_uv_requested': normalize_requested,
+    'normalize_uv_applied': normalize_applied,
+    'normalization_skipped_reason': normalization_skipped_reason,
+    'normalization_margin': 1.0 / max(1, int(options['resolution'])) if options['udims'] == 1 else None,
     'preflight': preflight,
     'source_profile': profile,
     'auto_uv_options': CONFIG['auto_uv_options'],

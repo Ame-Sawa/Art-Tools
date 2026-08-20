@@ -53,6 +53,11 @@ from cli_anything.blender.core.fbx import (
     _resolve_topology_prefilter_level, TOPOLOGY_RISK_VERSION,
 )
 from cli_anything.blender.utils import blender_backend
+from cli_anything.blender.utils.blender_backend import (
+    CancellationContext,
+    CancellationRequested,
+    _run_managed_process,
+)
 from cli_anything.blender.core.session import Session
 
 
@@ -1437,7 +1442,12 @@ class TestFbxAutoUv:
         assert "single_tile_margin" in script
         assert "copy_uv_same_topology" in script
         assert "process_mesh(obj, temp_root, index)" in script
-        assert script.count("run_unwrap(") == 2  # definition plus the one original-topology call
+        assert script.count("run_unwrap(") == 3  # definition plus per-Mesh and combined calls
+        assert "create_combined_object" in script
+        assert "validate_combined_obj_and_write_uv" in script
+        assert "bpy.ops.uv.pack_islands" not in script
+        assert "'merge_meshes': True" in script
+        assert "'normalize_uv': True" in script
         assert "quads_convert_to_tris" not in script
         assert "make_triangulated_copy" not in script
         assert "copy_uv_from_triangulated_mesh" not in script
@@ -1462,6 +1472,21 @@ class TestFbxAutoUv:
         assert "subprocess.Popen" in script
         assert "FBX_AUTO_UV_RESULT" in script
         assert "bpy.ops.export_scene.fbx" in script
+
+    def test_generated_auto_uv_script_accepts_pipeline_switches_and_file_timeout(self, tmp_path):
+        script = generate_fbx_auto_uv_script(
+            str(tmp_path / "source.fbx"),
+            str(tmp_path / "output.fbx"),
+            executable_path=str(tmp_path / "UnWrapConsole3.exe"),
+            external_timeout=47,
+            file_timeout=913,
+            auto_uv_options={"merge_meshes": False, "normalize_uv": False, "udims": 2},
+        )
+        compile(script, "<fbx_auto_uv_pipeline_script>", "exec")
+        assert "'merge_meshes': False" in script
+        assert "'normalize_uv': False" in script
+        assert "'external_timeout': 47" in script
+        assert "'file_timeout': 913" in script
 
     def test_generated_auto_uv_script_supports_prefilter_levels(self, tmp_path):
         strict = generate_fbx_auto_uv_script(
@@ -1562,6 +1587,12 @@ class TestFbxAutoUv:
             _validate_ministry_of_flat_options({"aspect": 0})
         with pytest.raises(ValueError, match="UDIM"):
             _validate_ministry_of_flat_options({"udims": 0})
+        defaults = _validate_ministry_of_flat_options({})
+        assert defaults["merge_meshes"] is True
+        assert defaults["normalize_uv"] is True
+        assert _validate_ministry_of_flat_options({
+            "merge_meshes": False, "normalize_uv": False,
+        })["merge_meshes"] is False
 
     def test_auto_uv_resolves_explicit_executable(self, tmp_path):
         executable = tmp_path / "UnWrapConsole3.exe"
@@ -1759,6 +1790,111 @@ class TestFbxAutoUv:
             )
         with pytest.raises(ValueError, match="positive integer"):
             export_fbx_auto_uv_batch([str(source_a)], jobs=0)
+
+    def test_managed_blender_process_terminates_on_cancellation(self, tmp_path):
+        context = CancellationContext(state_file=str(tmp_path / "manifest.json"))
+        outcome = {}
+
+        def run_child():
+            try:
+                _run_managed_process(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    timeout=60,
+                    cancellation=context,
+                    kind="test-blender",
+                )
+            except CancellationRequested as error:
+                outcome["error"] = str(error)
+
+        worker = threading.Thread(target=run_child)
+        worker.start()
+        deadline = time.monotonic() + 3
+        while not context.registry.snapshot() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert context.registry.snapshot()
+        context.request_cancel("test")
+        worker.join(5)
+        assert not worker.is_alive()
+        assert "cleanup" in outcome["error"]
+        assert context.registry.snapshot() == []
+        context.close()
+
+    def test_auto_uv_batch_cancels_active_and_queued_files(self, tmp_path, monkeypatch):
+        sources = []
+        for name in ("a.fbx", "b.fbx", "c.fbx", "d.fbx"):
+            path = tmp_path / name
+            path.write_bytes(b"placeholder")
+            sources.append(path)
+        cancel_file = tmp_path / "cancel.marker"
+        context = CancellationContext(
+            cancel_file=str(cancel_file),
+            state_file=str(tmp_path / "manifest.json"),
+        )
+        started = []
+        events = []
+
+        def fake_export(source_path, *args, cancellation_context=None, **kwargs):
+            started.append(Path(source_path).name)
+            while not cancellation_context.is_cancelled():
+                time.sleep(0.01)
+            raise CancellationRequested("test cancellation")
+
+        monkeypatch.setattr(fbx_mod, "export_fbx_auto_uv", fake_export)
+        outcome = {}
+
+        def run_batch():
+            outcome["result"] = export_fbx_auto_uv_batch(
+                [str(path) for path in sources],
+                suffix="_autouv",
+                jobs=2,
+                progress_callback=events.append,
+                cancellation_context=context,
+            )
+
+        worker = threading.Thread(target=run_batch)
+        worker.start()
+        deadline = time.monotonic() + 3
+        while len(started) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cancel_file.write_text("cancel\n", encoding="utf-8")
+        worker.join(5)
+        assert not worker.is_alive()
+        result = outcome["result"]
+        assert result["cancelled"] is True
+        assert result["cancelled_count"] == 4
+        assert result["success_count"] == 0
+        assert all(item.get("cancelled") for item in result["results"])
+        assert [event["event"] for event in events].count("batch_cancel_requested") == 1
+        assert not [
+            event for event in events
+            if event["event"] == "file_started" and event["index"] > 2
+        ]
+        context.close()
+
+    def test_stale_autouv_run_cleanup_removes_only_registered_temps(self, tmp_path, monkeypatch):
+        run_root = tmp_path / "autouv-runs"
+        run_dir = run_root / "run-stale"
+        run_dir.mkdir(parents=True)
+        hidden_staging = tmp_path / ".model_pending.fbx"
+        user_output = tmp_path / "model.fbx"
+        hidden_staging.write_bytes(b"staging")
+        user_output.write_bytes(b"user output")
+        (run_dir / "manifest.json").write_text(
+            json.dumps({
+                "pid": 999999,
+                "temp_paths": [str(hidden_staging), str(user_output)],
+                "processes": [],
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(blender_backend, "AUTOUV_RUN_ROOT", str(run_root))
+
+        removed = blender_backend.cleanup_stale_autouv_runs()
+
+        assert str(run_dir) in removed
+        assert not hidden_staging.exists()
+        assert user_output.exists()
+        assert not run_dir.exists()
 
 
 class TestFbxSmartUv:
