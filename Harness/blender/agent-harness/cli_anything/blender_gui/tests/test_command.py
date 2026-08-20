@@ -57,6 +57,14 @@ def test_batch_request_accepts_parallel_jobs_and_rejects_invalid_value(tmp_path:
         validate_batch_request(
             [str(source)], "autouv", "source", "", None, 10, 10, None, jobs=0,
         )
+    request = validate_batch_request(
+        [str(source)], "autouv", "source", "", None, 10, 10, None, jobs=50,
+    )
+    assert request.jobs == 50
+    with pytest.raises(ValueError, match="并行任务数"):
+        validate_batch_request(
+            [str(source)], "autouv", "source", "", None, 10, 10, None, jobs=51,
+        )
 
 
 def test_batch_suffix_mode_uses_fixed_algorithm_suffix(tmp_path: Path):

@@ -35,6 +35,7 @@ def test_main_window_is_batch_only_and_starts_empty(qapp, monkeypatch):
     assert not window.output_dir_edit.isEnabled()
     assert window.topology_prefilter_combo.currentData() == "high"
     assert window.parallel_jobs_spin.value() == 2
+    assert window.parallel_jobs_spin.maximum() == 50
     assert window.timeout_spin.value() == 300
     assert window.external_timeout_spin.value() == 120
     assert window.merge_meshes_check.isChecked()

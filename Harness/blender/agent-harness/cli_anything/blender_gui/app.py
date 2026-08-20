@@ -45,6 +45,7 @@ from .command import (
     AUTO_UV_DEFAULTS,
     DEFAULT_ANGLE_DEGREES,
     DEFAULT_PARALLEL_JOBS,
+    MAX_PARALLEL_JOBS,
     build_batch_uv_args,
     batch_output_paths,
     parse_cli_json,
@@ -253,10 +254,12 @@ class UniformUVWindow(QMainWindow):
         self.external_timeout_spin.setSuffix(" 秒")
 
         self.parallel_jobs_spin = QSpinBox()
-        self.parallel_jobs_spin.setRange(1, 16)
+        self.parallel_jobs_spin.setRange(1, MAX_PARALLEL_JOBS)
         self.parallel_jobs_spin.setValue(DEFAULT_PARALLEL_JOBS)
         self.parallel_jobs_spin.setSuffix(" 个")
-        self.parallel_jobs_spin.setToolTip("每个 FBX 使用独立 Blender/AutoUV 进程；设置为 1 即串行。")
+        self.parallel_jobs_spin.setToolTip(
+            f"每个 FBX 使用独立 Blender/AutoUV 进程；设置为 1 即串行，最多 {MAX_PARALLEL_JOBS} 个。"
+        )
 
         self.resolution_spin = QSpinBox()
         self.resolution_spin.setRange(1, 16384)
@@ -504,7 +507,7 @@ class UniformUVWindow(QMainWindow):
             self.timeout_spin.setValue(min(timeout, 86400))
         parallel_jobs = values.get("parallel_jobs")
         if isinstance(parallel_jobs, int) and parallel_jobs > 0:
-            self.parallel_jobs_spin.setValue(min(parallel_jobs, 16))
+            self.parallel_jobs_spin.setValue(min(parallel_jobs, MAX_PARALLEL_JOBS))
         saved_level = values.get("topology_prefilter_level")
         if saved_level not in {"off", "high", "medium"}:
             legacy = values.get("topology_prefilter")

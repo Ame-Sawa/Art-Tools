@@ -16,7 +16,7 @@ the JSON scene project as the source of truth, make changes through CLI
 commands, and verify the result through JSON inspection and real preview
 artifacts when Blender is available.
 
-## Locate and invoke the CLI
+## Locate and initialize the CLI
 
 Set the harness directory to:
 
@@ -24,30 +24,34 @@ Set the harness directory to:
 <workspace>/Harness/blender/agent-harness
 ```
 
-In this workspace, the absolute path is:
+On Windows, initialize the harness once from the repository root:
 
-```text
-H:\WorkSpace\Art-Tools\Harness\blender\agent-harness
+```powershell
+Harness\blender\agent-harness\initialize_windows.bat
 ```
+
+The script requires Python 3.10+ and Blender. It creates a local `.venv`,
+installs the package, and writes the machine-specific Blender path to
+`Harness/blender/agent-harness/.env.local`.
 
 Prefer the installed entry point when it exists:
 
 ```powershell
-$cli = 'H:\WorkSpace\Art-Tools\Harness\blender\agent-harness\.venv\Scripts\cli-anything-blender.exe'
+$harness = (Resolve-Path 'Harness\blender\agent-harness').Path
+$cli = Join-Path $harness '.venv\Scripts\cli-anything-blender.exe'
 & $cli --help
 ```
 
 Otherwise run the module from the harness directory:
 
 ```powershell
-Set-Location 'H:\WorkSpace\Art-Tools\Harness\blender\agent-harness'
+Set-Location '<workspace>\Harness\blender\agent-harness'
 python -m cli_anything.blender --help
 ```
 
 When the checkout has moved, locate `cli_anything/blender/blender_cli.py` and
-use its `agent-harness` parent instead of assuming the example drive letter.
-Do not use the stale `cli.blender_cli` module path shown in older package
-examples.
+use its `agent-harness` parent. Do not use the stale `cli.blender_cli` module
+path shown in older package examples.
 
 ## Operating rules
 
@@ -152,16 +156,18 @@ an ad-hoc bpy importer. Use absolute paths and verify every returned output:
 & $cli --json fbx material-colors 'C:\assets\model.fbx' 'C:\out\materials.png' --overwrite
 & $cli --json fbx multi-angle 'C:\assets\model.fbx' 'C:\out\views' --view front --view right --view top --overwrite
 & $cli --json fbx smart-uv-project 'C:\assets\model.fbx' --output 'C:\out\model_uv.fbx' --overwrite
-& $cli --json fbx auto-uniform-uv 'C:\assets\model.fbx' --output 'C:\out\model_uniform_uv.fbx' --overwrite
+& $cli --json fbx auto-uv 'C:\assets\model.fbx' --algorithm uniform --output 'C:\out\model_uniform_uv.fbx' --overwrite
 ```
 
 `smart-uv-project` validates the exported scene after Smart UV unwrapping.
 Use `--overwrite-source` only when the user explicitly wants the source FBX
 replaced and no separate output path is supplied.
 
-For the repository's fixed objective of a uniform checkerboard, prefer
-`fbx auto-uniform-uv`. It ignores source UV coordinates, removes existing UV
-layers, creates a fresh `map1`, searches Smart UV angle candidates, and ranks
+The unified `fbx auto-uv` command accepts `--algorithm autouv` for Ministry of
+Flat or `--algorithm uniform` for Blender Uniform UV. For the repository's
+fixed objective of a uniform checkerboard, prefer `--algorithm uniform`. It
+ignores source UV coordinates, removes existing UV layers, creates a fresh
+`map1`, searches Smart UV angle candidates, and ranks
 them by local checker stretch first and texel-density variation second. The
 default candidates are 10, 15, 20, 25, 30, 40, 50, 60, and 66 degrees; use
 repeated `--angle-deg` options to supply a smaller or custom search set. In
@@ -171,8 +177,9 @@ JSON mode inspect `selected_angle_limit_degrees`, `selected_metrics`,
 
 Use `smart-uv-project` when a single known angle or other explicit Smart UV
 settings must be applied. Its `--angle-limit` is in radians and it does not
-search or rank candidates. Do not compare source UV coordinates for a
-re-unwrapping task; compare only hierarchy, transforms, mesh structure,
+search or rank candidates. Use `fbx auto-uv --algorithm uniform` when the CLI
+should search and rank angle candidates. Do not compare source UV coordinates
+for a re-unwrapping task; compare only hierarchy, transforms, mesh structure,
 materials, animation, and output UV validity.
 
 For safe delivery, write to a separate absolute output path by default. Use

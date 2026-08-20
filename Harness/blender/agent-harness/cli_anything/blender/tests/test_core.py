@@ -1790,6 +1790,8 @@ class TestFbxAutoUv:
             )
         with pytest.raises(ValueError, match="positive integer"):
             export_fbx_auto_uv_batch([str(source_a)], jobs=0)
+        with pytest.raises(ValueError, match="between 1 and 50"):
+            export_fbx_auto_uv_batch([str(source_a)], jobs=51)
 
     def test_managed_blender_process_terminates_on_cancellation(self, tmp_path):
         context = CancellationContext(state_file=str(tmp_path / "manifest.json"))

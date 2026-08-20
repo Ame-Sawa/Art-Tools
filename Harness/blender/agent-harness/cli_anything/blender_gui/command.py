@@ -35,6 +35,7 @@ AUTO_UV_DEFAULTS = {
 AUTO_UV_ALGORITHMS = ("autouv", "uniform")
 TOPOLOGY_PREFILTER_LEVELS = ("off", "high", "medium")
 DEFAULT_PARALLEL_JOBS = 2
+MAX_PARALLEL_JOBS = 50
 
 
 @dataclass(frozen=True)
@@ -230,8 +231,8 @@ def validate_batch_request(
     jobs_value = int(jobs)
     if timeout_value < 1 or external_timeout_value < 1:
         raise ValueError("超时时间必须大于 0 秒。")
-    if jobs_value < 1:
-        raise ValueError("并行任务数必须大于 0。")
+    if jobs_value < 1 or jobs_value > MAX_PARALLEL_JOBS:
+        raise ValueError(f"并行任务数必须在 1 到 {MAX_PARALLEL_JOBS} 之间。")
     resolution_value = int(resolution)
     udims_value = int(udims)
     density_value = int(density)

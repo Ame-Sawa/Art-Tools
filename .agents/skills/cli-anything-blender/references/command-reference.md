@@ -165,22 +165,43 @@ fbx smart-uv-project ABSOLUTE_INPUT_FBX
     [--area-weight N] [--correct-aspect|--no-correct-aspect]
     [--scale-to-bounds|--no-scale-to-bounds]
 
-fbx auto-uniform-uv ABSOLUTE_INPUT_FBX
-    [--output ABSOLUTE_OUTPUT_FBX | --overwrite-source] [--overwrite]
-    [--timeout SECONDS] [--angle-deg DEGREES]...
+fbx auto-uv ABSOLUTE_INPUT_FBX [ADDITIONAL_INPUT_FBX ...]
+    [--algorithm autouv|uniform]
+    [--output ABSOLUTE_OUTPUT_FBX | --output-dir ABSOLUTE_DIR | --suffix TEXT
+     | --overwrite-source]
+    [--overwrite] [--timeout SECONDS] [--external-timeout SECONDS]
+    [--jobs N] [--topology-prefilter-level off|high|medium]
+    [--unwrap-exe ABSOLUTE_EXE] [--resolution PX] [--udims N]
+    [--separate-hard-edges|--no-separate-hard-edges]
+    [--aspect RATIO] [--use-normals|--no-use-normals]
+    [--overlap-identical|--no-overlap-identical]
+    [--overlap-mirrored|--no-overlap-mirrored]
+    [--world-scale|--no-world-scale] [--density PIXELS]
+    [--merge-meshes|--no-merge-meshes]
+    [--normalize-uv|--no-normalize-uv]
+    [--angle-deg DEGREES]...
+    [--rotate-method AXIS_ALIGNED|AXIS_ALIGNED_X|AXIS_ALIGNED_Y]
 ```
 
 FBX render and Smart UV commands execute Blender headlessly and verify their
 outputs. Keep source files intact by choosing a separate output path unless
 replacement is explicitly requested.
 
-`auto-uniform-uv` removes source UV layers and re-unwraps each unique mesh. It
-searches the default angle candidates 10, 15, 20, 25, 30, 40, 50, 60, and 66
-degrees unless repeated `--angle-deg` values are supplied. It selects by
+`fbx auto-uv --algorithm uniform` removes source UV layers and re-unwraps each
+unique mesh. It searches the default angle candidates 10, 15, 20, 25, 30, 40,
+50, 60, and 66 degrees unless repeated `--angle-deg` values are supplied. It selects by
 area-weighted P95 local stretch, maximum stretch, then texel-density variation;
 UV island count and packing efficiency are not optimization targets. JSON mode
 reports every candidate and the selected metrics before the normal FBX
 round-trip validation.
+
+`fbx auto-uv --algorithm autouv` uses the bundled Ministry of Flat executable by
+default. It supports multiple FBX inputs, batch output directories, concurrent
+jobs, timeout controls, topology-risk prefiltering, UDIM, world-scale UV,
+cross-Mesh merging and UV normalization. In JSON mode, progress events are
+written to stderr and the final aggregate result is written to stdout. A batch
+continues after individual failures or topology skips and returns a non-zero
+exit code if any input failed or was skipped.
 
 ## Session
 

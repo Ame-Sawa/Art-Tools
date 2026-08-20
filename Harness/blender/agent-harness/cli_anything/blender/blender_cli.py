@@ -1130,8 +1130,8 @@ def fbx_smart_uv_project(fbx_path, output_path, overwrite, overwrite_source, tim
               help="Per-file Blender total timeout in seconds; configurable without a hard cap.")
 @click.option("--external-timeout", type=int, default=120, show_default=True,
               help="Per-mesh or combined external AutoUV timeout in seconds.")
-@click.option("--jobs", type=int, default=2, show_default=True,
-              help="Maximum number of FBX files processed concurrently; use 1 for serial mode.")
+@click.option("--jobs", type=click.IntRange(1, fbx_mod.MAX_AUTO_UV_JOBS), default=2, show_default=True,
+              help=f"Maximum number of FBX files processed concurrently (1-{fbx_mod.MAX_AUTO_UV_JOBS}); use 1 for serial mode.")
 @click.option("--cancel-file", type=click.Path(dir_okay=False), default=None,
               hidden=True, help="Internal cooperative cancellation marker used by the GUI.")
 @click.option("--topology-prefilter/--no-topology-prefilter", default=None,

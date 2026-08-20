@@ -318,8 +318,8 @@ process tree is terminated with `taskkill /T /F` (or the Unix process group is
 terminated), and the result records whether cleanup succeeded.
 
 Batch processing uses up to two independent Blender/Ministry of Flat workers by
-default. Use `--jobs 1` for serial processing or increase `--jobs` when the
-machine has sufficient CPU and memory. Files are scheduled independently, the
+default. Use `--jobs 1` for serial processing or increase `--jobs` up to 50 when
+the machine has sufficient CPU and memory. Files are scheduled independently, the
 final JSON results remain in input order, and progress events include the
 completed-file count. A failed or timed-out worker releases its slot so later
 files continue processing. Use the GUI's internal `--cancel-file` mechanism or

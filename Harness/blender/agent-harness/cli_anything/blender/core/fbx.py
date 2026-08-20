@@ -18,6 +18,7 @@ DEFAULT_MULTI_ANGLE_VIEWS = ("front", "right", "top", "perspective")
 SMART_UV_MARGIN_METHODS = ("SCALED", "ADD", "FRACTION")
 SMART_UV_ROTATE_METHODS = ("AXIS_ALIGNED", "AXIS_ALIGNED_X", "AXIS_ALIGNED_Y")
 AUTO_UV_ALGORITHMS = ("autouv", "uniform")
+MAX_AUTO_UV_JOBS = 50
 SMART_UV_DEFAULTS = {
     "angle_limit": 1.1519173383712769,
     "margin_method": "SCALED",
@@ -1139,8 +1140,10 @@ def export_fbx_auto_uv_batch(
         requested_jobs = int(jobs)
     except (TypeError, ValueError) as error:
         raise ValueError("jobs must be a positive integer.") from error
-    if requested_jobs < 1:
-        raise ValueError("jobs must be a positive integer.")
+    if requested_jobs < 1 or requested_jobs > MAX_AUTO_UV_JOBS:
+        raise ValueError(
+            f"jobs must be a positive integer between 1 and {MAX_AUTO_UV_JOBS}."
+        )
     effective_jobs = min(requested_jobs, len(inputs))
     resolved_prefilter_level = (
         _resolve_topology_prefilter_level(topology_prefilter_level, topology_prefilter)
