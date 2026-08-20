@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,9 @@ from .settings import load_settings, save_settings
 TABLE_STYLE = (
     "QTableWidget { border: 1px solid #000000; gridline-color: #000000; }"
     "QTableWidget::item { border: 1px solid #000000; }"
+    "QTableWidget::item:selected { background-color: #2F75B5; color: #FFFFFF; }"
+    "QTableWidget::item:selected:active { background-color: #2F75B5; color: #FFFFFF; }"
+    "QTableWidget::item:selected:!active { background-color: #5B9BD5; color: #FFFFFF; }"
     "QHeaderView::section { border: 1px solid #000000; }"
 )
 STATUS_COLORS = {
@@ -69,6 +73,123 @@ STATUS_COLORS = {
     "已取消": QColor("#D9D9D9"),
     "日志": QColor("#E7E6E6"),
 }
+MAX_DETAIL_LENGTH = 120
+
+
+def summarize_diagnostic(detail: object, status: str = "失败") -> str:
+    """Convert technical CLI/Blender errors into a short Chinese summary."""
+
+    text = " ".join(str(detail or "").split())
+    if not text:
+        return "处理失败" if status == "失败" else status
+
+    timeout = re.search(
+        r"(?:timed out after|超过)\s*([0-9]+(?:\.[0-9]+)?)\s*(?:seconds|秒)",
+        text,
+        re.IGNORECASE,
+    )
+    if timeout and ("UnWrapConsole3" in text or "AutoUV" in text):
+        return f"外部 AutoUV 超时（{timeout.group(1)} 秒）；请提高‘外部程序超时’"
+    if timeout or "processing_timeout" in text.lower():
+        return f"Blender 处理超时（{timeout.group(1) if timeout else '?'} 秒）；请提高 Blender 总超时或减少并行任务"
+    if re.search(r"produced no (?:combined )?output OBJ", text, re.IGNORECASE):
+        return "AutoUV 未生成 OBJ 输出"
+    if "no valid UV layer" in text or "没有有效 UV" in text:
+        return "AutoUV 输出中没有有效 UV"
+    if (
+        "topology" in text.lower()
+        or "vertex count changed" in text.lower()
+        or "polygon count changed" in text.lower()
+        or "loop count changed" in text.lower()
+        or "reordered faces or vertices" in text.lower()
+    ):
+        return "AutoUV 改变了模型拓扑，已回滚"
+    if "round-trip validation failed" in text.lower():
+        return "FBX 导出或校验失败，未提交输出"
+    if "topology risk" in text.lower() or "拓扑风险" in text or "达到高风险阈值" in text:
+        return "拓扑风险较高，已跳过"
+    if status == "已取消" or "cancel" in text.lower():
+        return "已取消"
+
+    # A Blender traceback usually ends with the useful RuntimeError line.
+    exception_lines = re.findall(
+        r"(?:RuntimeError|ValueError|TypeError|OSError|FileNotFoundError):\s*(.+)",
+        text,
+        re.IGNORECASE,
+    )
+    if exception_lines:
+        text = exception_lines[-1].strip()
+    text = text.replace("Blender FBX AutoUV export reported a script error", "Blender 脚本执行失败")
+    text = text.replace("Blender FBX Uniform UV export reported a script error", "Blender 脚本执行失败")
+    if status == "跳过":
+        prefix = "已跳过："
+    elif status == "处理中":
+        prefix = "处理中："
+    else:
+        prefix = "处理失败："
+    summary = prefix + text
+    if len(summary) > MAX_DETAIL_LENGTH:
+        summary = summary[: MAX_DETAIL_LENGTH - 1].rstrip() + "…"
+    return summary
+
+
+class LogViewerDialog(QDialog):
+    """Non-modal readable activity log viewer."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Blender UV Tools - 运行日志")
+        self.resize(900, 620)
+        layout = QVBoxLayout(self)
+        self.table_widget = QTableWidget(0, 5)
+        self.table_widget.setObjectName("log_table")
+        self.table_widget.setHorizontalHeaderLabels(("序号", "状态", "文件名/来源", "输出路径", "详情"))
+        self.table_widget.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table_widget.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_widget.setAlternatingRowColors(True)
+        self.table_widget.verticalHeader().setVisible(False)
+        self.table_widget.setStyleSheet(TABLE_STYLE)
+        header = self.table_widget.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        layout.addWidget(self.table_widget, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        copy_button = QPushButton("复制日志")
+        copy_button.clicked.connect(self._copy)
+        buttons.addButton(copy_button, QDialogButtonBox.ActionRole)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+
+    def set_rows(self, rows: list[dict]) -> None:
+        self.table_widget.setRowCount(0)
+        for row_data in rows:
+            row = self.table_widget.rowCount()
+            self.table_widget.insertRow(row)
+            values = row_data["values"]
+            tooltips = row_data["tooltips"]
+            status = row_data["status"]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(tooltips[column] or value))
+                item.setBackground(STATUS_COLORS.get(status, QColor("#FFFFFF")))
+                self.table_widget.setItem(row, column, item)
+        if rows:
+            self.table_widget.scrollToBottom()
+
+    def _copy(self) -> None:
+        lines = []
+        for row in range(self.table_widget.rowCount()):
+            values = [
+                self.table_widget.item(row, column).text()
+                for column in range(self.table_widget.columnCount())
+                if self.table_widget.item(row, column) is not None
+            ]
+            lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
 
 
 class BatchInputDialog(QDialog):
@@ -189,7 +310,7 @@ class UniformUVWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Blender UV Tools")
-        self.resize(820, 720)
+        self.resize(1100, 720)
 
         self.process: Optional[QProcess] = None
         self._stdout = ""
@@ -206,6 +327,9 @@ class UniformUVWindow(QMainWindow):
         self._output_suffix = "_autouv"
         self._algorithm = "autouv"
         self.batch_paths: list[str] = []
+        self._log_dialog: Optional[LogViewerDialog] = None
+        self._activity_records: list[dict] = []
+        self._logged_result_keys: set[str] = set()
 
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItem("Blender Uniform UV", "uniform")
@@ -308,6 +432,8 @@ class UniformUVWindow(QMainWindow):
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
+        self.open_log_button = QPushButton("打开日志窗口")
+        self.open_log_button.clicked.connect(self._open_log_window)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
@@ -315,28 +441,14 @@ class UniformUVWindow(QMainWindow):
         self.status_label = QLabel("请选择待处理的 FBX 批次。")
         self.status_label.setWordWrap(True)
 
-        self.activity_table = QTableWidget(0, 5)
-        self.activity_table.setObjectName("activity_table")
-        self.activity_table.setHorizontalHeaderLabels(("序号", "状态", "文件名", "输出路径", "详情"))
-        self.activity_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.activity_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.activity_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.activity_table.setAlternatingRowColors(True)
-        self.activity_table.setSortingEnabled(False)
-        self.activity_table.verticalHeader().setVisible(False)
-        activity_header = self.activity_table.horizontalHeader()
-        activity_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        activity_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        activity_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        activity_header.setSectionResizeMode(3, QHeaderView.Stretch)
-        activity_header.setSectionResizeMode(4, QHeaderView.Stretch)
-        self.activity_table.setStyleSheet(TABLE_STYLE)
         self._activity_rows: dict[str, int] = {}
         self._activity_log_count = 0
 
         self._build_ui()
         self._load_saved_settings()
         self._algorithm_changed(self.algorithm_combo.currentIndex())
+        # Fit the visible settings form after algorithm-specific sections are shown.
+        self.resize(1100, self.sizeHint().height())
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -433,14 +545,10 @@ class UniformUVWindow(QMainWindow):
         action_row = QHBoxLayout()
         action_row.addWidget(self.run_button)
         action_row.addWidget(self.cancel_button)
+        action_row.addWidget(self.open_log_button)
         action_row.addWidget(self.progress, 1)
         action_row.addWidget(self.status_label, 2)
         root.addLayout(action_row)
-
-        activity_group = QGroupBox("日志与结果")
-        activity_layout = QVBoxLayout(activity_group)
-        activity_layout.addWidget(self.activity_table)
-        root.addWidget(activity_group, 2)
 
         self.setCentralWidget(central)
         self.setStyleSheet(
@@ -818,9 +926,23 @@ class UniformUVWindow(QMainWindow):
         return
 
     def _clear_activity_table(self) -> None:
-        self.activity_table.setRowCount(0)
+        self._activity_records.clear()
         self._activity_rows.clear()
         self._activity_log_count = 0
+        self._logged_result_keys.clear()
+        self._sync_log_window()
+
+    def _open_log_window(self) -> None:
+        if self._log_dialog is None:
+            self._log_dialog = LogViewerDialog(self)
+        self._sync_log_window()
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def _sync_log_window(self) -> None:
+        if self._log_dialog is not None:
+            self._log_dialog.set_rows(self._activity_records)
 
     def _cleanup_cancel_run(self) -> None:
         cancel_dir = self._cancel_dir
@@ -841,38 +963,67 @@ class UniformUVWindow(QMainWindow):
         status: str,
         output_path: str = "",
         detail: str = "",
+        tooltip_detail: str = "",
     ) -> None:
         key = self._path_key(input_path)
         row = self._activity_rows.get(key)
         if row is None:
-            row = self.activity_table.rowCount()
-            self.activity_table.insertRow(row)
+            row = len(self._activity_records)
             self._activity_rows[key] = row
         planned_output = output_path
-        if not planned_output and self.activity_table.item(row, 3) is not None:
-            planned_output = self.activity_table.item(row, 3).text()
+        if not planned_output and row < len(self._activity_records):
+            planned_output = self._activity_records[row]["values"][3]
         values = (str(index), status, Path(input_path).name, planned_output, detail)
-        tooltips = ("", "", os.path.abspath(input_path), planned_output, detail)
-        for column, value in enumerate(values):
-            item = self.activity_table.item(row, column)
-            if item is None:
-                item = QTableWidgetItem()
-                self.activity_table.setItem(row, column, item)
-            item.setText(str(value))
-            if tooltips[column]:
-                item.setToolTip(tooltips[column])
-            item.setBackground(STATUS_COLORS.get(status, QColor("#FFFFFF")))
+        tooltips = (
+            "",
+            "",
+            os.path.abspath(input_path),
+            planned_output,
+            tooltip_detail or detail,
+        )
+        record = {
+            "values": values,
+            "tooltips": tooltips,
+            "status": status,
+        }
+        if row == len(self._activity_records):
+            self._activity_records.append(record)
+        else:
+            self._activity_records[row] = record
+        self._sync_log_window()
 
-    def _append_activity_log(self, message: str) -> None:
+    def _append_activity_log(
+        self,
+        message: str,
+        tooltip: str = "",
+        table: bool = True,
+    ) -> None:
         self._activity_log_count += 1
-        row = self.activity_table.rowCount()
-        self.activity_table.insertRow(row)
         values = ("", "日志", "CLI", "", message)
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(str(value))
-            item.setToolTip(str(value))
-            item.setBackground(STATUS_COLORS["日志"])
-            self.activity_table.setItem(row, column, item)
+        tooltips = ("", "", "CLI", "", tooltip or message)
+        self._activity_records.append({
+            "values": values,
+            "tooltips": tooltips,
+            "status": "日志",
+        })
+        self._sync_log_window()
+
+    def _record_file_result_log(
+        self,
+        input_path: str,
+        status: str,
+        summary: str,
+        tooltip: str = "",
+    ) -> None:
+        key = self._path_key(input_path)
+        if key in self._logged_result_keys:
+            return
+        self._logged_result_keys.add(key)
+        self._append_activity_log(
+            f"{Path(input_path).name}：{summary}",
+            tooltip=tooltip or summary,
+            table=False,
+        )
 
     def _populate_pending_rows(self, request) -> None:
         for index, input_path in enumerate(request.source_paths, 1):
@@ -912,7 +1063,7 @@ class UniformUVWindow(QMainWindow):
             self._handle_progress_event(event)
             return
         self._stderr += line + "\n"
-        self._append_activity_log(line)
+        self._append_activity_log(summarize_diagnostic(line), tooltip=line)
 
     def _handle_progress_event(self, event: dict) -> None:
         event_name = event.get("event")
@@ -924,6 +1075,10 @@ class UniformUVWindow(QMainWindow):
             self.progress.setValue(0)
             jobs = event.get("effective_jobs", event.get("jobs", 1))
             self.status_label.setText(f"批处理开始：共 {total} 个文件，并行 {jobs}。")
+            self._append_activity_log(
+                f"批处理开始：共 {total} 个文件，并行 {jobs}。",
+                table=False,
+            )
             return
 
         if event_name == "batch_cancel_requested":
@@ -944,6 +1099,10 @@ class UniformUVWindow(QMainWindow):
                 "处理中",
                 detail=f"正在处理（{index}/{total}）",
             )
+            self._append_activity_log(
+                f"开始处理：{Path(input_path).name}",
+                table=False,
+            )
             return
 
         if event_name == "file_finished":
@@ -961,7 +1120,6 @@ class UniformUVWindow(QMainWindow):
                 f"运行中：{int(event.get('active_jobs') or 0)} 个"
             )
             input_path = str(event.get("input_fbx", ""))
-            name = Path(input_path).name
             output_path = str(event.get("output_fbx") or "")
             duration = event.get("duration_seconds")
             duration_text = (
@@ -969,19 +1127,26 @@ class UniformUVWindow(QMainWindow):
                 if isinstance(duration, (int, float)) else ""
             )
             if event.get("cancelled"):
-                detail = str(event.get("error") or "文件在批处理取消时未完成")
+                raw_detail = str(event.get("error") or "文件在批处理取消时未完成")
+                detail = "已取消"
                 self._set_activity_row(
-                    input_path, index, "已取消", output_path, detail + duration_text,
+                    input_path,
+                    index,
+                    "已取消",
+                    output_path,
+                    detail + duration_text,
+                    raw_detail + duration_text,
                 )
+                self._record_file_result_log(input_path, "已取消", detail, raw_detail)
             elif event.get("skipped"):
                 skip_reason = event.get("skip_reason")
                 if skip_reason == "processing_timeout":
-                    detail = event.get("error") or (
+                    raw_detail = str(event.get("error") or (
                         f"单个 FBX 处理超过 {event.get('timeout_seconds', 300)} 秒"
-                    )
+                    ))
                     cleanup = event.get("process_cleanup")
-                    if cleanup and "process cleanup" not in detail.lower():
-                        detail += (
+                    if cleanup and "process cleanup" not in raw_detail.lower():
+                        raw_detail += (
                             "；外部进程树清理"
                             f"{'成功' if cleanup.get('ok') else '失败'}"
                         )
@@ -1001,30 +1166,48 @@ class UniformUVWindow(QMainWindow):
                         f"，最大面边数 {highest_mesh.get('max_polygon_vertices', '?')}"
                         if highest_mesh else ""
                     )
-                    detail = (
+                    raw_detail = (
                         f"拓扑风险评分 {preflight.get('risk_score', event.get('risk_score', '?'))} "
                         f"（{preflight.get('risk_level', '高风险')}）"
                         + metrics
                         + (f"；触发：{reasons}" if reasons else "")
                     )
                 else:
-                    detail = event.get("error") or skip_reason or "未提供原因"
-                self._set_activity_row(input_path, index, "跳过", output_path, detail + duration_text)
+                    raw_detail = str(event.get("error") or skip_reason or "未提供原因")
+                detail = summarize_diagnostic(raw_detail, "跳过")
+                self._set_activity_row(
+                    input_path,
+                    index,
+                    "跳过",
+                    output_path,
+                    detail + duration_text,
+                    str(raw_detail) + duration_text,
+                )
+                self._record_file_result_log(input_path, "跳过", detail, str(raw_detail))
             elif event.get("ok"):
                 warnings = event.get("warnings") or []
-                suffix = f"；预警：{' | '.join(warnings)}" if warnings else ""
+                detail = "处理完成"
+                if warnings:
+                    detail += "；有预警"
+                raw_detail = "；预警：" + " | ".join(str(value) for value in warnings) if warnings else detail
                 self._set_activity_row(
                     input_path, index, "成功", output_path,
-                    f"处理完成{suffix}{duration_text}",
+                    detail + duration_text,
+                    raw_detail + duration_text,
                 )
+                self._record_file_result_log(input_path, "成功", detail, raw_detail)
             else:
+                raw_detail = str(event.get("error", "未知错误"))
+                detail = summarize_diagnostic(raw_detail)
                 self._set_activity_row(
                     input_path,
                     index,
                     "失败",
                     output_path,
-                    str(event.get("error", "未知错误")) + duration_text,
+                    detail + duration_text,
+                    raw_detail + duration_text,
                 )
+                self._record_file_result_log(input_path, "失败", detail, raw_detail)
             return
 
         if event_name == "batch_finished":
@@ -1038,6 +1221,13 @@ class UniformUVWindow(QMainWindow):
                 f"失败 {event.get('failure_count', 0)}，"
                 f"跳过 {event.get('skipped_count', 0)}，"
                 f"取消 {event.get('cancelled_count', 0)}，共 {total} 个文件。"
+            )
+            self._append_activity_log(
+                f"批处理阶段完成：成功 {event.get('success_count', 0)}，"
+                f"失败 {event.get('failure_count', 0)}，"
+                f"跳过 {event.get('skipped_count', 0)}，"
+                f"取消 {event.get('cancelled_count', 0)}，共 {total} 个文件。",
+                table=False,
             )
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
@@ -1057,19 +1247,24 @@ class UniformUVWindow(QMainWindow):
                 f"；耗时 {float(duration):.2f} 秒"
                 if isinstance(duration, (int, float)) else ""
             )
+            output_path = str(item.get("output_fbx") or "")
+            row_index = int(item.get("index") or index)
             if item.get("cancelled"):
                 cleanup = item.get("process_cleanup") or []
                 cleanup_text = ""
                 if cleanup:
                     cleanup_text = f"；清理进程 {len(cleanup)} 个"
+                raw_detail = str(item.get("error") or "文件在批处理取消时未完成") + cleanup_text
+                detail = "已取消"
                 self._set_activity_row(
                     input_path,
-                    int(item.get("index") or index),
+                    row_index,
                     "已取消",
-                    str(item.get("output_fbx") or ""),
-                    str(item.get("error") or "文件在批处理取消时未完成")
-                    + cleanup_text + duration_text,
+                    output_path,
+                    detail + duration_text,
+                    raw_detail + duration_text,
                 )
+                self._record_file_result_log(input_path, "已取消", detail, raw_detail)
             elif item.get("skipped"):
                 if item.get("skip_reason") == "topology_risk":
                     rules = preflight.get("triggered_rules") or []
@@ -1086,15 +1281,22 @@ class UniformUVWindow(QMainWindow):
                         detail += f"；最高风险 Mesh：{preflight['highest_risk_mesh']}"
                     if rule_text:
                         detail += f"；触发：{rule_text}"
+                    raw_detail = detail
                 else:
-                    detail = str(item.get("error") or item.get("skip_reason") or "未提供原因")
+                    raw_detail = str(item.get("error") or item.get("skip_reason") or "未提供原因")
                     cleanup = item.get("process_cleanup") or {}
                     if cleanup:
-                        detail += f"；进程清理：{'成功' if cleanup.get('ok') else '失败'}"
+                        raw_detail += f"；进程清理：{'成功' if cleanup.get('ok') else '失败'}"
+                summary = summarize_diagnostic(raw_detail, "跳过")
                 self._set_activity_row(
-                    input_path, int(item.get("index") or index), "跳过",
-                    str(item.get("output_fbx") or ""), detail + duration_text,
+                    input_path,
+                    row_index,
+                    "跳过",
+                    output_path,
+                    summary + duration_text,
+                    raw_detail + duration_text,
                 )
+                self._record_file_result_log(input_path, "跳过", summary, raw_detail)
             elif item.get("ok"):
                 warnings = item.get("warnings") or []
                 detail = "处理完成"
@@ -1106,17 +1308,31 @@ class UniformUVWindow(QMainWindow):
                         f"；归一化 {pipeline.get('normalized_meshes', 0)} 个 Mesh"
                     )
                 if warnings:
-                    detail += "；预警：" + " | ".join(str(value) for value in warnings)
+                    detail += "；有预警"
+                raw_detail = detail
+                if warnings:
+                    raw_detail += "；预警：" + " | ".join(str(value) for value in warnings)
                 self._set_activity_row(
-                    input_path, int(item.get("index") or index), "成功",
-                    str(item.get("output_fbx") or ""), detail + duration_text,
+                    input_path,
+                    row_index,
+                    "成功",
+                    output_path,
+                    detail + duration_text,
+                    raw_detail + duration_text,
                 )
+                self._record_file_result_log(input_path, "成功", detail, raw_detail)
             else:
+                raw_detail = str(item.get("error") or "未知错误")
+                detail = summarize_diagnostic(raw_detail)
                 self._set_activity_row(
-                    input_path, int(item.get("index") or index), "失败",
-                    str(item.get("output_fbx") or ""),
-                    str(item.get("error") or "未知错误") + duration_text,
+                    input_path,
+                    row_index,
+                    "失败",
+                    output_path,
+                    detail + duration_text,
+                    raw_detail + duration_text,
                 )
+                self._record_file_result_log(input_path, "失败", detail, raw_detail)
 
     def _process_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         if self.process is None:
@@ -1192,19 +1408,19 @@ class UniformUVWindow(QMainWindow):
             else:
                 message = self._error_message(raw_stdout, self._stderr, exit_code)
                 self.status_label.setText("处理失败。")
-                self._append_activity_log(message)
+                self._append_activity_log(summarize_diagnostic(message), tooltip=message)
         else:
             try:
                 result = parse_cli_json(raw_stdout)
             except ValueError as exc:
                 self.status_label.setText("CLI 返回结果无法解析。")
                 message = self._error_message(raw_stdout, self._stderr, exit_code, parse_error=str(exc))
-                self._append_activity_log(message)
+                self._append_activity_log(summarize_diagnostic(message), tooltip=message)
             else:
                 if "error" in result:
                     message = self._error_message(raw_stdout, self._stderr, exit_code)
                     self.status_label.setText("处理失败。")
-                    self._append_activity_log(message)
+                    self._append_activity_log(summarize_diagnostic(message), tooltip=message)
                 else:
                     self._update_activity_from_result(result)
                     total = int(result.get("total") or self._progress_total or 1)

@@ -22,6 +22,23 @@ def make_fbx(tmp_path: Path, name: str) -> Path:
     return path
 
 
+def result_table(window):
+    window._open_log_window()
+    return window._log_dialog.table_widget
+
+
+def find_table_row(table, status=None, filename=None, detail_contains=None):
+    for row in range(table.rowCount()):
+        if status is not None and table.item(row, 1).text() != status:
+            continue
+        if filename is not None and table.item(row, 2).text() != filename:
+            continue
+        if detail_contains is not None and detail_contains not in table.item(row, 4).text():
+            continue
+        return row
+    raise AssertionError("table row not found")
+
+
 def test_main_window_is_batch_only_and_starts_empty(qapp, monkeypatch):
     monkeypatch.setattr(app_module, "load_settings", lambda: {})
     window = app_module.UniformUVWindow()
@@ -41,8 +58,67 @@ def test_main_window_is_batch_only_and_starts_empty(qapp, monkeypatch):
     assert window.merge_meshes_check.isChecked()
     assert window.normalize_uv_check.isChecked()
     assert "跨 Mesh 合并展开并归一化 UV" in window.autouv_status_label.text()
-    assert window.activity_table.columnCount() == 5
-    assert "#000000" in window.activity_table.styleSheet()
+    assert not hasattr(window, "activity_table")
+    assert window.open_log_button.text() == "打开日志窗口"
+    window.show()
+    qapp.processEvents()
+    assert window.height() == window.sizeHint().height()
+    assert window.height() <= 800
+    window.close()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "RuntimeError: UnWrapConsole3.exe timed out after 10.0 seconds; process cleanup succeeded.",
+            "外部 AutoUV 超时（10.0 秒）；请提高‘外部程序超时’",
+        ),
+        ("UnWrapConsole3.exe produced no output OBJ.", "AutoUV 未生成 OBJ 输出"),
+        ("Vertex count changed during OBJ round-trip.", "AutoUV 改变了模型拓扑，已回滚"),
+        ("FBX round-trip validation failed: {'errors': ['x']}", "FBX 导出或校验失败，未提交输出"),
+    ],
+)
+def test_gui_summarizes_diagnostics(raw, expected):
+    assert app_module.summarize_diagnostic(raw) == expected
+
+
+def test_gui_log_window_is_non_modal_and_updates_live(qapp):
+    window = app_module.UniformUVWindow()
+    window._append_activity_log("开始处理：asset.fbx", table=False)
+    window._open_log_window()
+
+    assert window._log_dialog is not None
+    assert window._log_dialog.isModal() is False
+    assert window._log_dialog.table_widget.rowCount() == 1
+    assert window._log_dialog.table_widget.columnCount() == 5
+    assert window._log_dialog.table_widget.item(0, 4).text() == "开始处理：asset.fbx"
+
+    window._append_activity_log("asset.fbx：处理完成", table=False)
+    assert window._log_dialog.table_widget.rowCount() == 2
+    assert "处理完成" in window._log_dialog.table_widget.item(1, 4).text()
+    window._log_dialog.close()
+
+
+def test_gui_file_timeout_uses_short_summary_and_raw_tooltip(qapp):
+    window = app_module.UniformUVWindow()
+    raw = (
+        "Blender FBX AutoUV export reported a script error: "
+        "RuntimeError: UnWrapConsole3.exe timed out after 10.0 seconds; "
+        "process cleanup succeeded."
+    )
+    window._handle_progress_event({
+        "event": "file_finished",
+        "index": 1,
+        "total": 1,
+        "input_fbx": r"H:\models\stairs.fbx",
+        "ok": False,
+        "error": raw,
+    })
+
+    detail = result_table(window).item(0, 4)
+    assert detail.text() == "外部 AutoUV 超时（10.0 秒）；请提高‘外部程序超时’"
+    assert raw in detail.toolTip()
 
 
 def test_batch_dialog_shows_output_preview_and_deletes_selected(qapp, tmp_path):
@@ -170,9 +246,9 @@ def test_gui_progress_events_update_file_count_and_status(qapp):
         "error": "simulated failure",
     })
     assert window.progress.value() == 2
-    assert window.activity_table.rowCount() == 2
-    assert window.activity_table.item(1, 1).text() == "失败"
-    assert "simulated failure" in window.activity_table.item(1, 4).text()
+    table = result_table(window)
+    failed_row = find_table_row(table, status="失败", filename="b.fbx")
+    assert "处理失败：simulated failure" in table.item(failed_row, 4).text()
 
 
 def test_gui_progress_events_display_topology_skip(qapp):
@@ -189,8 +265,10 @@ def test_gui_progress_events_display_topology_skip(qapp):
         "preflight": {"risk_score": 15, "risk_level": "high"},
     })
 
-    assert window.activity_table.item(0, 1).text() == "跳过"
-    assert "15" in window.activity_table.item(0, 4).text()
+    table = result_table(window)
+    skipped_row = find_table_row(table, status="跳过")
+    assert table.item(skipped_row, 4).text() == "拓扑风险较高，已跳过"
+    assert "15" in table.item(skipped_row, 4).toolTip()
     assert window.progress.value() == 1
 
     formatted = window._format_result({
@@ -225,8 +303,10 @@ def test_gui_progress_events_display_cancelled_file(qapp):
         "error": "Batch cancelled before this file started.",
     })
 
-    assert window.activity_table.item(0, 1).text() == "已取消"
-    assert "cancelled" in window.activity_table.item(0, 4).text()
+    table = result_table(window)
+    cancelled_row = find_table_row(table, status="已取消")
+    assert table.item(cancelled_row, 4).text() == "已取消"
+    assert "cancelled" in table.item(cancelled_row, 4).toolTip()
 
 
 def test_gui_parallel_progress_uses_completed_count_not_input_index(qapp):
@@ -241,8 +321,9 @@ def test_gui_parallel_progress_uses_completed_count_not_input_index(qapp):
         "duration_seconds": 1.25,
     })
     assert window.progress.value() == 1
-    assert window.activity_table.item(0, 1).text() == "成功"
-    assert "1.25" in window.activity_table.item(0, 4).text()
+    table = result_table(window)
+    success_row = find_table_row(table, status="成功", filename="c.fbx")
+    assert "1.25" in table.item(success_row, 4).text()
 
     window._handle_progress_event({
         "event": "file_finished", "index": 1, "total": 3,
@@ -251,8 +332,8 @@ def test_gui_parallel_progress_uses_completed_count_not_input_index(qapp):
         "error": "failed", "duration_seconds": 2.5,
     })
     assert window.progress.value() == 2
-    assert window.activity_table.item(1, 1).text() == "失败"
-    assert "2.50" in window.activity_table.item(1, 4).text()
+    failed_row = find_table_row(table, status="失败", filename="a.fbx")
+    assert "2.50" in table.item(failed_row, 4).text()
 
 
 def test_gui_error_message_includes_exit_code_and_diagnostics(qapp):
@@ -271,5 +352,6 @@ def test_gui_stderr_line_parser_separates_progress_from_diagnostics(qapp):
 
     assert window.progress.maximum() == 3
     assert "ordinary diagnostic" in window._stderr
-    assert window.activity_table.item(0, 1).text() == "日志"
-    assert "ordinary diagnostic" in window.activity_table.item(0, 4).text()
+    table = result_table(window)
+    diagnostic_row = find_table_row(table, status="日志", detail_contains="ordinary diagnostic")
+    assert "ordinary diagnostic" in table.item(diagnostic_row, 4).text()
