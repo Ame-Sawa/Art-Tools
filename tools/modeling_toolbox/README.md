@@ -22,20 +22,30 @@
 ## AutoUV
 
 在 3D View 的 `Tool` 标签页中，选择一个或多个网格对象，然后点击
-`UV 工具 > AutoUV（Ministry of Flat）`。工具会逐个导出临时 OBJ，调用随插件
-附带的 `third_party/MinistryOfFlat/UnWrapConsole3.exe`，并将生成的 UV 写回当前活动的
-UV Map。不会额外创建新的 UV Map；如果对象没有 UV Map，才会创建默认的 `UVMap`。
-材质和对象结构会保留。
+`UV 工具 > AutoUV（Ministry of Flat）`。面板提供“跨 Mesh 合并调用”和“UV 归一化”两个
+独立开关。
 
-当 `UDIM 数量=1` 时，工具允许执行跨 Mesh 全局处理。所有选中的独立 Mesh 完成 AutoUV
-后，会先由 Blender 按各 Mesh 原始 UV 的相对尺寸执行不缩放的 Pack Islands，再将全部已
-打包 UV 使用同一个缩放比例统一归一化到带边距的 `0-1` Tile。这样可以避免不同 Mesh
-之间的 UV 岛重叠，同时保留它们之间的相对 UV 大小关系。
+当“跨 Mesh 合并调用”开启且 `UDIM 数量=1` 时，工具会将选中的独立 Mesh 转换到世界空间
+后合并为一个临时 OBJ，保存源 Mesh/Loop 映射清单，只调用一次随插件附带的
+`third_party/MinistryOfFlat/UnWrapConsole3.exe`，再将输出 OBJ 的 UV 按清单映射回各源 Mesh。
+这个过程不会使用 Blender `Pack Islands`，也不会修改原始对象的几何、材质、变换或层级。
 
-“跨 Mesh 全局打包（先打包后统一归一化）”默认开启。开启“按世界尺寸缩放 UV”时仍会执行
-上述流程，但最后的整体归一化会改变绝对纹素密度；不同 Mesh 之间的相对大小会尽量保持。
-只有 `UDIM 数量>1` 时才跳过跨 Mesh 全局打包并保留原始 UDIM 范围。关闭该选项可恢复
-逐 Mesh 独立处理；共享同一 Mesh datablock 的对象会继续共享同一套 UV。
+合并和逐 Mesh 两条路径都按原始 `mof.py` 使用 Blender OBJ 导出器默认参数：保留源 UV 和法线，
+只关闭材质导出，并使用 Blender 默认的修改器、对象变换和轴向设置。合并路径会先将源 Mesh
+转换到世界空间临时 Mesh，同时复制活动 UV 和 Loop 法线；因此同一个单 Mesh 在勾选或不勾选
+合并调用时，外部程序接收的 OBJ 数据保持一致。
+
+外部程序的输出会严格校验顶点数量、面数量、面角点顺序、顶点索引和顶点坐标；只有确认
+外部程序只修改 UV 后才会写回。输出缺失、拓扑/几何变化或映射失败会回滚所有受影响 Mesh
+的 UV。当前活动 UV Map 会被覆盖，其他 UV Map 保留；没有 UV Map 时才创建默认的 `UVMap`。
+
+“UV 归一化”开启且 `UDIM=1` 时，合并模式会对全部 Mesh 的 UV 使用同一个均匀缩放和平移
+归一化到带分辨率边距的 `0-1 Tile`；逐 Mesh 模式则分别归一化每个 Mesh。归一化不会重新
+排列单个 Mesh 内的 UV 岛，只改变整体缩放和位置。关闭该选项时保留 Ministry of Flat 返回
+的原始 UV 范围。开启“按世界尺寸缩放 UV”时仍可归一化，但绝对纹素密度可能改变。
+
+`UDIM 数量>1` 时始终逐 Mesh 调用外部程序并跳过 UV 归一化，以保留原始 UDIM 范围。共享
+同一 Mesh datablock 的对象只处理一次并继续共享同一套 UV。
 
 面板中的主要参数会按 Ministry of Flat 的原始命令行参数传递，包括纹理分辨率、像素
 宽高比、UDIM 数量、硬边分离、重叠/镜像重叠、世界尺寸缩放、纹素密度和接缝方向中心。
@@ -44,6 +54,6 @@ UV Map。不会额外创建新的 UV Map；如果对象没有 UV Map，才会创
 原脚本的程序目录设置也被保留：在 Blender 的插件偏好设置中可以指定外部
 `UnWrapConsole3.exe` 所在目录；留空时使用插件内置版本。
 
-如果关闭“跨 Mesh 全局打包”，外部程序失败、超时、没有输出 OBJ 或拓扑校验失败时，
-对应 Mesh 不会写入 UV，其余选中 Mesh 仍会继续处理。全局打包开启时，任一 Mesh 或
-Blender 全局打包阶段失败，工具会回滚本次所有 UV 修改。
+如果未使用合并调用，外部程序失败、超时、没有输出 OBJ、拓扑校验或归一化失败时，
+对应 Mesh 会恢复本次操作前的 UV，其余选中 Mesh 仍会继续处理。合并调用开启时，任一
+外部处理、严格映射或最终归一化失败，工具会回滚本次所有 UV 修改。

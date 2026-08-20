@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 import subprocess
@@ -47,10 +48,18 @@ class MODELING_TOOLBOX_PG_autouv_settings(bpy.types.PropertyGroup):
     worldscale: bpy.props.BoolProperty(name="按世界尺寸缩放 UV", default=False)
     density: bpy.props.IntProperty(name="纹素密度", default=1024, min=1)
     global_pack: bpy.props.BoolProperty(
-        name="跨 Mesh 全局打包（先打包后统一归一化）",
+        name="跨 Mesh 合并调用",
         description=(
-            "先按各 Mesh 原始 UV 相对尺寸进行不缩放打包，再统一归一化到 0-1 Tile；"
-            "UDIM 必须为 1，世界尺寸 UV 可用但可能改变绝对纹素密度"
+            "将选中的独立 Mesh 合并为一个临时 OBJ，一次调用 Ministry of Flat，"
+            "再按源 Mesh/Loop 映射写回；不使用 Blender Pack Islands，UDIM 必须为 1"
+        ),
+        default=True,
+    )
+    normalize_uv: bpy.props.BoolProperty(
+        name="UV 归一化",
+        description=(
+            "UDIM=1 时将外部生成的 UV 使用统一均匀缩放和平移归一化到 0-1 Tile；"
+            "UDIM>1 时跳过并保留原始 UDIM 范围"
         ),
         default=True,
     )
@@ -123,7 +132,7 @@ def _safe_autouv_filename(name):
 def _set_only_object_selected(obj, view_layer):
     for candidate in list(view_layer.objects):
         if candidate is not None:
-            candidate.select_set(candidate == obj)
+            candidate.select_set(candidate.name == obj.name)
     view_layer.objects.active = obj
 
 
@@ -163,14 +172,6 @@ def _normalize_autouv_uv_layer(uv_layer, margin=AUTO_UV_SINGLE_TILE_MARGIN):
     max_x = max(item.uv.x for item in uv_layer.data)
     min_y = min(item.uv.y for item in uv_layer.data)
     max_y = max(item.uv.y for item in uv_layer.data)
-    if (
-        min_x >= 0.0
-        and max_x <= 1.0
-        and min_y >= 0.0
-        and max_y <= 1.0
-    ):
-        return False
-
     span_x = max_x - min_x
     span_y = max_y - min_y
     largest_span = max(span_x, span_y)
@@ -187,7 +188,12 @@ def _normalize_autouv_uv_layer(uv_layer, margin=AUTO_UV_SINGLE_TILE_MARGIN):
     return True
 
 
-def _copy_autouv_layer(source_obj, imported_obj, normalize_to_unit_tile=False):
+def _copy_autouv_layer(
+    source_obj,
+    imported_obj,
+    normalize_to_unit_tile=False,
+    normalization_margin=AUTO_UV_SINGLE_TILE_MARGIN,
+):
     source_mesh = source_obj.data
     imported_mesh = imported_obj.data
     imported_uv_layer = imported_mesh.uv_layers.active
@@ -209,7 +215,7 @@ def _copy_autouv_layer(source_obj, imported_obj, normalize_to_unit_tile=False):
 
     normalized = False
     if normalize_to_unit_tile:
-        normalized = _normalize_autouv_uv_layer(uv_layer)
+        normalized = _normalize_autouv_uv_layer(uv_layer, normalization_margin)
 
     source_mesh.uv_layers.active_index = source_mesh.uv_layers.find(uv_layer.name)
     source_mesh.update()
@@ -230,7 +236,7 @@ def _unique_mesh_objects(objects):
 
 
 def _normalize_meshes_globally(objects, settings):
-    """Apply one uniform UV transform to all active UV layers after global packing."""
+    """Apply one uniform UV transform after a combined external AutoUV call."""
     representatives = _unique_mesh_objects(objects)
     active_layers = []
     min_x = float("inf")
@@ -271,6 +277,291 @@ def _normalize_meshes_globally(objects, settings):
         mesh.update()
 
     return scale
+
+
+def _create_combined_autouv_object(objects, manifest_path):
+    """Create a world-space temporary mesh and a deterministic loop mapping manifest."""
+    vertices = []
+    faces = []
+    loop_sources = []
+    mesh_entries = []
+
+    for mesh_index, obj in enumerate(objects):
+        source_mesh = obj.data
+        vertex_offset = len(vertices)
+        polygon_offset = len(faces)
+        loop_offset = len(loop_sources)
+
+        vertices.extend(tuple(obj.matrix_world @ vertex.co) for vertex in source_mesh.vertices)
+        for polygon in source_mesh.polygons:
+            face = []
+            for loop_index in polygon.loop_indices:
+                loop = source_mesh.loops[loop_index]
+                face.append(vertex_offset + loop.vertex_index)
+                loop_sources.append(
+                    {
+                        "mesh_index": mesh_index,
+                        "loop_index": loop_index,
+                    }
+                )
+            faces.append(face)
+
+        mesh_entries.append(
+            {
+                "mesh_index": mesh_index,
+                "object_name": obj.name,
+                "mesh_name": source_mesh.name,
+                "vertex_count": len(source_mesh.vertices),
+                "polygon_count": len(source_mesh.polygons),
+                "loop_count": len(source_mesh.loops),
+                "vertex_offset": vertex_offset,
+                "polygon_offset": polygon_offset,
+                "loop_offset": loop_offset,
+            }
+        )
+
+    if not vertices or not faces or not loop_sources:
+        raise RuntimeError("选中的 Mesh 没有可合并导出的面或顶点")
+
+    manifest = {
+        "version": 1,
+        "meshes": mesh_entries,
+        "loop_sources": loop_sources,
+        "vertex_count": len(vertices),
+        "polygon_count": len(faces),
+        "loop_count": len(loop_sources),
+    }
+    with Path(manifest_path).open("w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+
+    combined_mesh = bpy.data.meshes.new("__AutoUV_CombinedMesh")
+    combined_mesh.from_pydata(vertices, [], faces)
+    combined_mesh.update()
+
+    active_uv_layers = [obj.data.uv_layers.active for obj in objects]
+    if any(layer is not None for layer in active_uv_layers):
+        combined_uv = combined_mesh.uv_layers.new(name="UVMap")
+        for combined_loop_index, source in enumerate(loop_sources):
+            source_layer = active_uv_layers[source["mesh_index"]]
+            if source_layer is not None:
+                combined_uv.data[combined_loop_index].uv = source_layer.data[
+                    source["loop_index"]
+                ].uv
+
+    combined_loop_normals = []
+    for obj in objects:
+        try:
+            normal_matrix = obj.matrix_world.to_3x3().inverted().transposed()
+        except ValueError:
+            normal_matrix = obj.matrix_world.to_3x3()
+        for loop in obj.data.loops:
+            world_normal = normal_matrix @ loop.normal
+            if world_normal.length <= VEGETATION_NORMAL_EPSILON:
+                world_normal = Vector((0.0, 0.0, 1.0))
+            else:
+                world_normal.normalize()
+            combined_loop_normals.append(tuple(world_normal))
+    if len(combined_loop_normals) == len(combined_mesh.loops):
+        combined_mesh.normals_split_custom_set(combined_loop_normals)
+        combined_mesh.update()
+
+    combined_object = bpy.data.objects.new("__AutoUV_CombinedObject", combined_mesh)
+    collection = objects[0].users_collection[0] if objects[0].users_collection else bpy.context.scene.collection
+    collection.objects.link(combined_object)
+    bpy.context.view_layer.update()
+    return combined_object, manifest
+
+
+def _remove_temporary_object(obj):
+    if obj is None:
+        return
+    mesh = getattr(obj, "data", None)
+    if obj.name in bpy.data.objects:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0 and mesh.name in bpy.data.meshes:
+        bpy.data.meshes.remove(mesh)
+    bpy.context.view_layer.update()
+
+
+def _resolve_obj_index(raw_index, count):
+    index = int(raw_index)
+    if index > 0:
+        resolved = index - 1
+    elif index < 0:
+        resolved = count + index
+    else:
+        raise ValueError("OBJ 索引不能为 0")
+    if resolved < 0 or resolved >= count:
+        raise ValueError("OBJ 索引超出范围")
+    return resolved
+
+
+def _parse_obj_geometry_and_uv(path):
+    """Parse only OBJ v/vt/f records needed for strict geometry and UV validation."""
+    vertices = []
+    uvs = []
+    faces = []
+    with Path(path).open("r", encoding="utf-8", errors="replace") as obj_file:
+        for line_number, line in enumerate(obj_file, start=1):
+            parts = line.strip().split()
+            if not parts or parts[0].startswith("#"):
+                continue
+            record = parts[0]
+            try:
+                if record == "v":
+                    if len(parts) < 4:
+                        raise ValueError("顶点坐标不完整")
+                    vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                elif record == "vt":
+                    if len(parts) < 3:
+                        raise ValueError("UV 坐标不完整")
+                    uvs.append((float(parts[1]), float(parts[2])))
+                elif record == "f":
+                    if len(parts) < 4:
+                        raise ValueError("面至少需要三个角点")
+                    corners = []
+                    for token in parts[1:]:
+                        fields = token.split("/")
+                        vertex_index = _resolve_obj_index(fields[0], len(vertices))
+                        uv_index = None
+                        if len(fields) > 1 and fields[1]:
+                            uv_index = _resolve_obj_index(fields[1], len(uvs))
+                        corners.append((vertex_index, uv_index))
+                    faces.append(corners)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"解析 OBJ 第 {line_number} 行失败：{error}") from error
+    return {"vertices": vertices, "uvs": uvs, "faces": faces}
+
+
+def _float_close(left, right, epsilon=1.0e-5):
+    return abs(left - right) <= epsilon
+
+
+def _validate_combined_obj_and_write_uv(objects, combined_object, input_path, output_path, manifest):
+    """Validate output geometry/order and write only output vt data to source active UVs."""
+    input_data = _parse_obj_geometry_and_uv(input_path)
+    output_data = _parse_obj_geometry_and_uv(output_path)
+    combined_mesh = combined_object.data
+
+    expected_faces = [
+        [combined_mesh.loops[index].vertex_index for index in polygon.loop_indices]
+        for polygon in combined_mesh.polygons
+    ]
+    if len(input_data["vertices"]) != len(combined_mesh.vertices):
+        raise RuntimeError("输入 OBJ 顶点数量与映射清单不一致")
+    if len(input_data["faces"]) != len(expected_faces):
+        raise RuntimeError("输入 OBJ 面数量与映射清单不一致")
+    if len(output_data["vertices"]) != len(input_data["vertices"]):
+        raise RuntimeError("外部 OBJ 修改了顶点数量")
+    if len(output_data["faces"]) != len(input_data["faces"]):
+        raise RuntimeError("外部 OBJ 修改了面数量")
+
+    for index, (input_vertex, output_vertex) in enumerate(
+        zip(input_data["vertices"], output_data["vertices"])
+    ):
+        if not all(_float_close(input_vertex[axis], output_vertex[axis]) for axis in range(3)):
+            raise RuntimeError(f"外部 OBJ 修改了顶点坐标（顶点 {index}）")
+
+    for face_index, (expected_face, input_face, output_face) in enumerate(
+        zip(expected_faces, input_data["faces"], output_data["faces"])
+    ):
+        input_vertices = [corner[0] for corner in input_face]
+        output_vertices = [corner[0] for corner in output_face]
+        if input_vertices != expected_face:
+            raise RuntimeError(f"输入 OBJ 重排了面或顶点索引（面 {face_index}）")
+        if output_vertices != input_vertices:
+            raise RuntimeError(f"外部 OBJ 重排了面或顶点索引（面 {face_index}）")
+        if len(output_face) != len(input_face):
+            raise RuntimeError(f"外部 OBJ 修改了面角点数量（面 {face_index}）")
+
+    if len(manifest.get("loop_sources", [])) != len(combined_mesh.loops):
+        raise RuntimeError("Loop 映射清单数量不一致")
+
+    source_layers = []
+    for obj in objects:
+        layer = obj.data.uv_layers.active
+        source_layers.append(layer)
+
+    pending_uvs = []
+    seen_loops = set()
+    for face_index, output_face in enumerate(output_data["faces"]):
+        polygon = combined_mesh.polygons[face_index]
+        for corner_index, corner in enumerate(output_face):
+            uv_index = corner[1]
+            if uv_index is None or uv_index >= len(output_data["uvs"]):
+                raise RuntimeError(f"外部 OBJ 缺少有效 UV 索引（面 {face_index}）")
+            combined_loop_index = polygon.loop_start + corner_index
+            source = manifest["loop_sources"][combined_loop_index]
+            source_key = (source["mesh_index"], source["loop_index"])
+            if source_key in seen_loops:
+                raise RuntimeError("Loop 映射清单存在重复回写目标")
+            seen_loops.add(source_key)
+            pending_uvs.append((source["mesh_index"], source["loop_index"], output_data["uvs"][uv_index]))
+
+    expected_loop_count = sum(len(obj.data.loops) for obj in objects)
+    if len(seen_loops) != expected_loop_count:
+        raise RuntimeError("外部 OBJ 未返回全部源 Loop 的 UV")
+
+    for mesh_index, obj in enumerate(objects):
+        if source_layers[mesh_index] is None:
+            source_layers[mesh_index] = obj.data.uv_layers.new(name="UVMap")
+    for mesh_index, loop_index, uv in pending_uvs:
+        source_layers[mesh_index].data[loop_index].uv = uv
+    for mesh_index, obj in enumerate(objects):
+        obj.data.uv_layers.active_index = obj.data.uv_layers.find(
+            source_layers[mesh_index].name
+        )
+        obj.data.update()
+
+
+def _run_autouv_for_objects_combined(
+    objects, executable_path, settings, temporary_directory, view_layer
+):
+    """Run Ministry of Flat once for all unique Mesh datablocks."""
+    input_path = Path(temporary_directory) / "combined_input.obj"
+    output_path = Path(temporary_directory) / "combined_unwrapped.obj"
+    manifest_path = Path(temporary_directory) / "combined_manifest.json"
+    combined_object = None
+    try:
+        combined_object, manifest = _create_combined_autouv_object(objects, manifest_path)
+        _set_only_object_selected(combined_object, view_layer)
+        bpy.ops.wm.obj_export(
+            filepath=str(input_path),
+            export_selected_objects=True,
+            export_materials=False,
+        )
+        if not input_path.is_file():
+            raise RuntimeError("Blender 没有生成合并临时 OBJ")
+
+        completed = subprocess.run(
+            _build_autouv_command(settings, executable_path, input_path, output_path),
+            cwd=str(executable_path.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=AUTO_UV_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if completed.returncode != 0 and not output_path.is_file():
+            details = (completed.stderr or completed.stdout or "").strip()
+            if len(details) > 400:
+                details = details[-400:]
+            suffix = f"：{details}" if details else ""
+            raise RuntimeError(f"UnWrapConsole3.exe 返回错误码 {completed.returncode}{suffix}")
+        if not output_path.is_file():
+            raise RuntimeError("外部程序没有生成合并输出 OBJ")
+        if completed.returncode != 0:
+            print(
+                "AutoUV 外部程序返回非零状态，但已生成有效输出，继续映射 UV："
+                f" {completed.returncode}"
+            )
+
+        _validate_combined_obj_and_write_uv(
+            objects, combined_object, input_path, output_path, manifest
+        )
+    finally:
+        _remove_temporary_object(combined_object)
 
 
 def _snapshot_uv_state(objects):
@@ -327,45 +618,23 @@ def _global_pack_enabled(settings):
     )
 
 
-def _global_pack_status_text(settings):
-    if not settings.global_pack:
-        return "当前：已关闭跨 Mesh 全局打包"
+def _global_pack_status_text(settings, mesh_count=None):
     if settings.udims > 1:
-        return "当前：UDIM>1，将跳过跨 Mesh 全局打包"
-    if settings.worldscale:
-        return "当前：将执行跨 Mesh 打包并归一化 UV（绝对纹素密度可能改变）"
-    return "当前：将执行跨 Mesh 打包并统一归一化 UV"
-
-
-def _pack_meshes_globally(objects, settings, view_layer):
-    """Pack active UVs from selected unique Mesh datablocks together."""
-    representatives = _unique_mesh_objects(objects)
-    if not representatives:
-        raise RuntimeError("没有可用于全局打包的 Mesh")
-
-    for candidate in list(view_layer.objects):
-        if candidate is not None:
-            candidate.select_set(candidate in representatives)
-    view_layer.objects.active = representatives[0]
-    margin = 1.0 / max(1, settings.resolution)
-
-    try:
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.uv.select_all(action="SELECT")
-        result = bpy.ops.uv.pack_islands(
-            rotate=True,
-            scale=False,
-            margin=margin,
-        )
-        if "FINISHED" not in result:
-            raise RuntimeError(f"Blender UV 全局打包未完成：{result}")
-    finally:
-        if bpy.context.mode != "OBJECT":
-            bpy.ops.object.mode_set(mode="OBJECT")
-        for obj in representatives:
-            obj.data.update()
-    return margin
+        return "当前：UDIM>1，逐 Mesh 调用 AutoUV，跳过 UV 归一化"
+    count_text = f"{mesh_count} 个独立 Mesh" if mesh_count is not None else "选中独立 Mesh"
+    if settings.global_pack and settings.normalize_uv:
+        status = "跨 Mesh 合并展开并归一化 UV"
+    elif settings.global_pack:
+        status = "跨 Mesh 合并展开，不归一化 UV"
+    elif settings.normalize_uv:
+        status = "逐 Mesh 展开并归一化 UV"
+    else:
+        status = "逐 Mesh 展开，不归一化 UV"
+    if settings.global_pack:
+        status = f"{status}（{count_text}）"
+    if settings.worldscale and settings.normalize_uv:
+        status += "（绝对纹素密度可能改变）"
+    return f"当前：{status}"
 
 
 def _autouv_bool(value):
@@ -492,8 +761,9 @@ def _run_autouv_for_object(
             obj,
             imported_meshes[0],
             normalize_to_unit_tile=(
-                settings.udims == 1 and not settings.worldscale and not settings.global_pack
+                settings.udims == 1 and settings.normalize_uv
             ),
+            normalization_margin=1.0 / max(1, settings.resolution),
         )
         return {"normalized": normalized}
     finally:
@@ -533,8 +803,8 @@ class OBJECT_OT_autouv_ministry_of_flat(bpy.types.Operator):
         settings = context.scene.modeling_toolbox_autouv
         active_before = view_layer.objects.active
         selected_before = list(context.selected_objects)
-        global_pack_enabled = _global_pack_enabled(settings)
-        uv_snapshot = _snapshot_uv_state(mesh_objects) if global_pack_enabled else []
+        global_merge_enabled = _global_pack_enabled(settings)
+        uv_snapshot = _snapshot_uv_state(mesh_objects) if global_merge_enabled else []
         temporary_directory = tempfile.mkdtemp(
             prefix="modeling_toolbox_autouv_",
             dir=bpy.app.tempdir,
@@ -542,59 +812,59 @@ class OBJECT_OT_autouv_ministry_of_flat(bpy.types.Operator):
         completed = 0
         succeeded = 0
         normalized_count = 0
-        pack_margin = None
-        pack_applied = False
         global_normalized = False
+        merge_applied = False
         rolled_back = False
         failures = []
 
         try:
-            for index, obj in enumerate(mesh_objects, start=1):
+            if global_merge_enabled:
                 try:
-                    result = _run_autouv_for_object(
-                        obj,
+                    _run_autouv_for_objects_combined(
+                        mesh_objects,
                         executable_path,
                         settings,
                         temporary_directory,
-                        index,
                         view_layer,
                     )
-                    completed += 1
-                    normalized_count += int(result.get("normalized", False))
-                except Exception as error:  # Keep processing the remaining selection.
-                    failures.append(f"{obj.name}: {error}")
-
-            if global_pack_enabled:
-                if failures:
+                    completed = len(mesh_objects)
+                    if settings.normalize_uv:
+                        _normalize_meshes_globally(mesh_objects, settings)
+                        global_normalized = True
+                    merge_applied = True
+                    succeeded = completed
+                except Exception as error:
+                    failures.append(f"跨 Mesh 合并调用失败：{error}")
                     _restore_uv_state(uv_snapshot)
                     rolled_back = True
                     normalized_count = 0
-                else:
+                    global_normalized = False
+            else:
+                for index, obj in enumerate(mesh_objects, start=1):
+                    mesh_snapshot = _snapshot_uv_state([obj])
                     try:
-                        pack_margin = _pack_meshes_globally(
-                            mesh_objects,
+                        result = _run_autouv_for_object(
+                            obj,
+                            executable_path,
                             settings,
+                            temporary_directory,
+                            index,
                             view_layer,
                         )
-                        _normalize_meshes_globally(mesh_objects, settings)
-                        global_normalized = True
-                        pack_applied = True
-                        succeeded = completed
-                    except Exception as error:
-                        failures.append(f"跨 Mesh 全局打包失败：{error}")
-                        _restore_uv_state(uv_snapshot)
-                        rolled_back = True
-                        normalized_count = 0
-                        global_normalized = False
-            else:
+                        completed += 1
+                        normalized_count += int(result.get("normalized", False))
+                    except Exception as error:  # Keep processing the remaining selection.
+                        _restore_uv_state(mesh_snapshot)
+                        failures.append(f"{obj.name}: {error}")
                 succeeded = completed
         finally:
             shutil.rmtree(temporary_directory, ignore_errors=True)
             if bpy.context.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
+            selected_names = {obj.name for obj in selected_before}
             for candidate in list(view_layer.objects):
                 if candidate is not None:
-                    candidate.select_set(candidate in selected_before)
+                    candidate.select_set(candidate.name in selected_names)
             if active_before is not None and active_before.name in bpy.data.objects:
                 view_layer.objects.active = active_before
 
@@ -622,12 +892,14 @@ class OBJECT_OT_autouv_ministry_of_flat(bpy.types.Operator):
                     if normalized_count
                     else ""
                 )
-            if pack_applied:
-                pack_text = f"，已跨 Mesh 不缩放打包（边距 {pack_margin:.6f}）"
-            elif settings.global_pack:
-                pack_text = "，已跳过全局打包（UDIM>1）"
+                if settings.normalize_uv and settings.udims > 1:
+                    normalized_text = "，已跳过 UV 归一化（UDIM>1）"
+            if merge_applied:
+                pack_text = f"，已合并 {len(mesh_objects)} 个独立 Mesh 并调用一次 AutoUV"
+            elif settings.global_pack and settings.udims > 1:
+                pack_text = "，未合并（UDIM>1），按 Mesh 分别调用 AutoUV"
             else:
-                pack_text = "，未启用跨 Mesh 全局打包"
+                pack_text = "，未启用跨 Mesh 合并调用"
             self.report(
                 {"INFO"},
                 f"AutoUV 完成：成功处理 {succeeded} 个独立 Mesh"
@@ -1358,7 +1630,7 @@ class OBJECT_OT_move_objects_to_world_origin(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def draw_autouv_settings(layout, settings):
+def draw_autouv_settings(layout, settings, context=None):
     main_box = layout.box()
     main_box.label(text="主要参数", icon="SETTINGS")
     main_box.prop(settings, "resolution")
@@ -1367,21 +1639,33 @@ def draw_autouv_settings(layout, settings):
     main_box.prop(settings, "udims")
     main_box.prop(settings, "center")
     main_box.prop(settings, "global_pack")
+    main_box.prop(settings, "normalize_uv")
 
     condition_box = main_box.box()
-    condition_box.label(text="全局打包使用条件", icon="INFO")
+    condition_box.label(text="AutoUV 合并与归一化说明", icon="INFO")
     condition_box.label(
-        text="使用条件：UDIM 数量必须为 1；开启世界尺寸 UV 仍可执行。"
+        text="跨 Mesh 合并调用仅在 UDIM=1 时生效；UDIM>1 时逐 Mesh 调用。"
     )
     condition_box.label(
-        text="先按各 Mesh 原始相对尺寸不缩放打包，再统一归一化到单个 0-1 Tile。"
+        text="开启 UV 归一化时，UDIM=1 会统一缩放到 0-1 Tile；关闭时保留外部 UV 范围。"
     )
     condition_box.label(
-        text="世界尺寸 UV 会改变绝对纹素密度；仅 UDIM 大于 1 时跳过全局打包。"
+        text="世界尺寸 UV 可继续使用，但归一化可能改变绝对纹素密度。"
     )
+    condition_box.label(
+        text="不会使用 Blender Pack Islands；合并与逐 Mesh 均使用 Blender OBJ 默认轴向。"
+    )
+    mesh_count = None
+    if context is not None:
+        selected_meshes = [
+            obj
+            for obj in context.selected_objects
+            if obj.type == "MESH" and obj.data is not None
+        ]
+        mesh_count = len(_unique_mesh_objects(selected_meshes))
     status_row = condition_box.row()
-    status_row.alert = bool(settings.global_pack and settings.udims > 1)
-    status_row.label(text=_global_pack_status_text(settings))
+    status_row.alert = settings.udims > 1
+    status_row.label(text=_global_pack_status_text(settings, mesh_count))
 
     row = main_box.row(align=True)
     row.prop(settings, "separate")
@@ -1502,7 +1786,7 @@ class VIEW3D_PT_modeling_toolbox(bpy.types.Panel):
             text="AutoUV（Ministry of Flat）",
             icon='UV_DATA',
         )
-        draw_autouv_settings(uv_box, context.scene.modeling_toolbox_autouv)
+        draw_autouv_settings(uv_box, context.scene.modeling_toolbox_autouv, context)
 
         material_box = layout.box()
         material_box.label(text="材质工具", icon='MATERIAL')
