@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fbx-modifier-tool"
+version = "0.1.0"
+description = "Standalone FBX modifier GUI scaffold built with PySide6."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+build = [
+    "PyInstaller>=6.0,<7",
+]
+
+[project.scripts]
+fbx-modifier-tool = "fbx_modifier_tool.main:main"
+fbx-diff-tool = "fbx_modifier_tool.fbx_diff:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
